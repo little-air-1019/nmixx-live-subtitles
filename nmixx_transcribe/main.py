@@ -21,6 +21,8 @@ WATCHDOG_INTERVAL_S = 10 * 60
 UPCOMING_POLL_INTERVAL_S = 60
 UPCOMING_POLL_START_BEFORE_S = 2 * 60
 UPCOMING_POLL_GIVEUP_AFTER_S = 2 * 3600
+MAX_JOB_ATTEMPTS = 5
+TERMINAL_STATUSES = ("completed", "ended", "none", "upcoming_timeout", "failed")
 
 # ponytail: plain dict persisted as JSON, single process, no DB. Fine for a single-stream service.
 _state: dict[str, dict] = {}
@@ -40,15 +42,23 @@ def _save_state() -> None:
     config.STATE_FILE.write_text(json.dumps(_state, indent=2))
 
 
-def _mark(video_id: str, status: str) -> None:
-    _state[video_id] = {"status": status, "ts": time.time()}
+def _mark(video_id: str, status: str, **extra) -> None:
+    entry = {"status": status, "ts": time.time(), **extra}
+    _state[video_id] = entry
     _save_state()
 
 
 async def run_live_job(video_id: str) -> None:
-    """Capture -> ASR -> translate -> Discord for one live video. Runs until stream ends."""
+    """Capture -> ASR -> translate -> Discord for one live video. Runs until stream ends.
+
+    A transient failure (network blip, Discord 5xx, capture hiccup) must not permanently
+    suppress retries: only a clean finish is "completed". A failure records "error" with an
+    attempt count so on_video/watchdog will retry it while videos.list still says it's live,
+    up to MAX_JOB_ATTEMPTS -- beyond that it's marked "failed" (terminal).
+    """
     global _current_job, _current_video_id
-    log.info("live job starting for video_id=%s", video_id)
+    attempt = _state.get(video_id, {}).get("attempt", 0) + 1
+    log.info("live job starting for video_id=%s (attempt %d)", video_id, attempt)
     poster = DiscordPoster()
     first_line = True
     segment_count = 0
@@ -62,11 +72,16 @@ async def run_live_job(video_id: str) -> None:
             await poster.send(line)
             segment_count += 1
         log.info("live job for video_id=%s ended: stream finished (%d segments)", video_id, segment_count)
+        _mark(video_id, "completed")
     except Exception:
-        log.exception("live job for video_id=%s crashed after %d segments", video_id, segment_count)
+        log.exception("live job for video_id=%s crashed after %d segments (attempt %d)", video_id, segment_count, attempt)
+        if attempt >= MAX_JOB_ATTEMPTS:
+            log.error("live job for video_id=%s failed permanently after %d attempts", video_id, attempt)
+            _mark(video_id, "failed", attempt=attempt)
+        else:
+            _mark(video_id, "error", attempt=attempt)
     finally:
         await poster.close()
-        _mark(video_id, "completed")
         _current_job = None
         _current_video_id = None
 
@@ -82,7 +97,8 @@ async def start_live_job(video_id: str) -> None:
         log.info("live job already active (video_id=%s), ignoring new live video_id=%s", _current_video_id, video_id)
         return
     _current_video_id = video_id
-    _mark(video_id, "live")
+    prior_attempts = _state.get(video_id, {}).get("attempt", 0)
+    _mark(video_id, "live", attempt=prior_attempts)
     _current_job = asyncio.create_task(run_live_job(video_id))
 
 
@@ -109,9 +125,11 @@ async def poll_upcoming(video_id: str, scheduled_start_epoch: float) -> None:
 
 
 async def on_video(video_id: str) -> None:
-    if video_id in _state and _state[video_id]["status"] in ("live", "completed", "ended", "none", "upcoming_timeout"):
-        log.info("video_id=%s already handled (status=%s), ignoring", video_id, _state[video_id]["status"])
+    existing = _state.get(video_id, {}).get("status")
+    if existing in TERMINAL_STATUSES or existing == "live":
+        log.info("video_id=%s already handled (status=%s), ignoring", video_id, existing)
         return
+    # existing == "error" falls through to retry below.
     state = await video_state(video_id)
     if state["status"] == "live":
         await start_live_job(video_id)
@@ -141,7 +159,7 @@ async def watchdog_loop() -> None:
         await asyncio.sleep(WATCHDOG_INTERVAL_S)
         try:
             video_id = await channel_live_video_id()
-            if video_id and video_id not in _state:
+            if video_id and (video_id not in _state or _state[video_id]["status"] == "error"):
                 log.info("watchdog found unhandled live video_id=%s", video_id)
                 await on_video(video_id)
         except Exception:
@@ -152,9 +170,28 @@ app = FastAPI()
 app.include_router(make_router(on_video))
 
 
+async def _resume_stale_jobs() -> None:
+    """A restart mid-stream leaves state="live" (or "error") with no _current_job running.
+    Recheck each against videos.list: still live -> restart the job; otherwise finalize it.
+    A stale "live"/"error" entry must never be silently treated as handled."""
+    stale = [vid for vid, entry in _state.items() if entry["status"] in ("live", "error")]
+    for video_id in stale:
+        state = await video_state(video_id)
+        if state["status"] == "live":
+            log.info("resuming stale live job for video_id=%s after restart", video_id)
+            await start_live_job(video_id)
+        else:
+            log.info("stale video_id=%s is now status=%s, finalizing", video_id, state["status"])
+            _mark(video_id, state["status"])
+
+
 @app.on_event("startup")
 async def startup() -> None:
     _load_state()
+    try:
+        await _resume_stale_jobs()
+    except Exception:
+        log.exception("resuming stale jobs failed, continuing boot")
     try:
         await websub_subscribe()
         log.info("websub subscribe ok")
