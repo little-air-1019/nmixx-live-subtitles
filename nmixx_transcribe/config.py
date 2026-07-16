@@ -23,5 +23,5 @@ YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")
 WEBSUB_VERIFY_TOKEN = os.environ.get("WEBSUB_VERIFY_TOKEN", "change-me")
 YOUTUBE_CHANNEL_ID = os.environ.get("YOUTUBE_CHANNEL_ID", "UCnUAyD4t2LkvW68YrDh7fDg")
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "medium")
 STATE_FILE = ROOT / "state.json"

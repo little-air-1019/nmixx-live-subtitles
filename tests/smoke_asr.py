@@ -70,32 +70,45 @@ def _audio_duration() -> float:
 
 
 async def _run() -> None:
+    print("[smoke] loading model (first run downloads weights)...")
+    load_t0 = time.monotonic()
+    engine = asr.build_engine()
+    load_wall = time.monotonic() - load_t0
+    print(f"[smoke] model load: {load_wall:.1f}s")
+
     duration = _audio_duration()
     print(f"[smoke] audio duration: {duration:.1f}s")
-    print("[smoke] loading model (first run downloads weights)...")
-    engine = asr.build_engine()
 
     hangul = 0
     n = 0
+    emitted_at: list[float] = []
     t0 = time.monotonic()
     async for seg in asr.transcribe(capture.pcm_stream(str(AUDIO)), engine=engine):
+        elapsed = time.monotonic() - t0
+        emitted_at.append(elapsed)
         n += 1
         hangul += sum(1 for ch in seg.text if "가" <= ch <= "힣")
-        print(f"[{seg.start:6.1f}-{seg.end:6.1f}] {seg.text}")
+        print(f"[+{elapsed:6.1f}s] [{seg.start:6.1f}-{seg.end:6.1f}] {seg.text}")
     wall = time.monotonic() - t0
 
     rtf = wall / duration if duration else float("inf")
+    spread = emitted_at[-1] - emitted_at[0] if len(emitted_at) >= 2 else 0.0
     print("\n[smoke] === summary ===")
     print(f"segments emitted : {n}")
     print(f"hangul chars     : {hangul}")
+    print(f"model load       : {load_wall:.1f}s")
     print(f"audio duration   : {duration:.1f}s")
     print(f"wall clock       : {wall:.1f}s")
+    print(f"emission spread  : {spread:.1f}s")
     print(f"realtime factor  : {rtf:.2f}x  ({'FASTER' if rtf < 1 else 'SLOWER'} than real time)")
 
     # A talk-heavy 180s clip must yield a real transcript, not one stray token,
-    # and must beat real time (or live transcription is impossible).
+    # must emit during transcription, and must beat real time (or live
+    # transcription is impossible).
     assert n >= 5, f"too few segments ({n}); expected >= 5 on a chatty clip"
     assert hangul >= 100, f"too little Korean ({hangul} hangul); expected >= 100"
+    assert emitted_at and emitted_at[0] < max(0.0, wall - 10.0), "first segment emitted only at stream end"
+    assert spread >= 10.0, f"segments clustered at end (spread={spread:.1f}s); expected >= 10s"
     assert rtf < 1.0, f"slower than real time (rtf={rtf:.2f})"
     print("[smoke] PASS")
 

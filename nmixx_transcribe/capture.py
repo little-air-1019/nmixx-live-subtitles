@@ -4,6 +4,7 @@ Spawns streamlink (falling back to yt-dlp) to pull the stream, pipes it
 through ffmpeg to raw PCM, and yields fixed-size chunks off an asyncio stream.
 """
 import asyncio
+import os
 import shutil
 from pathlib import Path
 from typing import AsyncGenerator, Optional
@@ -52,28 +53,52 @@ async def _spawn_stream_pipeline(source: str) -> tuple[asyncio.subprocess.Proces
     container to stdout, ffmpeg transcodes to PCM.
     """
     url = _youtube_url(source)
-    if shutil.which("streamlink"):
-        puller = await asyncio.create_subprocess_exec(
-            "streamlink", "--stdout", "--default-stream", "best", url,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-    elif shutil.which("yt-dlp"):
-        puller = await asyncio.create_subprocess_exec(
-            "yt-dlp", "-f", "bestaudio/best", "-o", "-", url,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-    else:
-        raise RuntimeError("neither streamlink nor yt-dlp found on PATH")
 
-    ffmpeg = await asyncio.create_subprocess_exec(
-        FFMPEG, "-nostdin", "-i", "pipe:0",
-        "-f", "s16le", "-acodec", "pcm_s16le", "-ar", str(SAMPLE_RATE), "-ac", "1",
-        "-loglevel", "error", "pipe:1",
-        stdin=puller.stdout, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
-    # Let ffmpeg own the read end; we only read ffmpeg's stdout.
-    if puller.stdout is not None:
-        puller.stdout.close()
+    def _yt_dlp_cmd() -> list[str]:
+        # ponytail: android player_client avoids yt-dlp's web-client SABR format-resolution
+        # error (github.com/yt-dlp/yt-dlp/issues/12482) that otherwise 403s live segment
+        # fetches; upgrade yt-dlp and drop this once that's fixed upstream.
+        return ["yt-dlp", "-f", "bestaudio/best", "-o", "-", "--extractor-args", "youtube:player_client=android", url]
+
+    # asyncio.subprocess can't wire one child's StreamReader directly into another
+    # child's stdin (it needs a real fd) -> use an actual OS pipe between them.
+    r_fd, w_fd = os.pipe()
+    try:
+        if shutil.which("streamlink"):
+            puller = await asyncio.create_subprocess_exec(
+                "streamlink", "--stdout", "--default-stream", "best", url,
+                stdout=w_fd, stderr=asyncio.subprocess.PIPE,
+            )
+            # streamlink can reject a URL outright (e.g. misclassifies it as VOD) and exit
+            # immediately instead of streaming -- fall back to yt-dlp for this pull rather
+            # than silently handing ffmpeg an empty pipe. Poll briefly instead of one fixed
+            # sleep since process startup time varies.
+            for _ in range(20):
+                if puller.returncode is not None:
+                    break
+                await asyncio.sleep(0.1)
+            if puller.returncode not in (None, 0) and shutil.which("yt-dlp"):
+                puller = await asyncio.create_subprocess_exec(
+                    *_yt_dlp_cmd(), stdout=w_fd, stderr=asyncio.subprocess.PIPE,
+                )
+        elif shutil.which("yt-dlp"):
+            puller = await asyncio.create_subprocess_exec(
+                *_yt_dlp_cmd(), stdout=w_fd, stderr=asyncio.subprocess.PIPE,
+            )
+        else:
+            raise RuntimeError("neither streamlink nor yt-dlp found on PATH")
+
+        ffmpeg = await asyncio.create_subprocess_exec(
+            FFMPEG, "-nostdin", "-i", "pipe:0",
+            "-f", "s16le", "-acodec", "pcm_s16le", "-ar", str(SAMPLE_RATE), "-ac", "1",
+            "-loglevel", "error", "pipe:1",
+            stdin=r_fd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+    finally:
+        # Parent must close both ends after handing them to the children, or EOF
+        # never propagates (ffmpeg would block forever waiting for more input).
+        os.close(w_fd)
+        os.close(r_fd)
     return puller, ffmpeg
 
 
@@ -97,6 +122,7 @@ async def pcm_stream(
     if puller is not None:
         stderr_tasks.append(asyncio.create_task(_drain_stderr(puller, "puller")))
 
+    failure: Exception | None = None
     try:
         while True:
             chunk = await ffmpeg.stdout.readexactly(chunk_bytes)
@@ -114,3 +140,10 @@ async def pcm_stream(
                     proc.kill()
         for t in stderr_tasks:
             t.cancel()
+        # A puller that exited non-zero (bad video id, geo-block, 403, etc.) produces
+        # an empty pipe that looks just like a clean, silent EOF to ffmpeg -- surface
+        # it instead of letting the caller read "0 chunks" as a normal empty stream.
+        if puller is not None and puller.returncode not in (None, 0):
+            failure = RuntimeError(f"capture puller exited {puller.returncode} for source={source!r}")
+    if failure is not None:
+        raise failure

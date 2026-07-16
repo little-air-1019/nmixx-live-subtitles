@@ -5,13 +5,20 @@ simulstreaming policy, which auto-selects the mlx-whisper backend on Apple
 Silicon. Language forced to ko, model from config.WHISPER_MODEL.
 """
 import asyncio
+import re
 from dataclasses import dataclass
-from typing import AsyncGenerator, AsyncIterable
+from typing import AsyncGenerator, AsyncIterable, NamedTuple
 
 from whisperlivekit import AudioProcessor, TranscriptionEngine
 from whisperlivekit.config import WhisperLiveKitConfig
 
 from nmixx_transcribe import config
+
+# WhisperLiveKit only closes out a line on a >5s silence (its hardcoded
+# MIN_DURATION_REAL_SILENCE), so a committed speech line can keep growing for
+# a long time. Split the committed stream ourselves when sentence punctuation
+# appears inside that growing line.
+_SENTENCE_END = re.compile(r"[.!?。！？…]+")
 
 
 @dataclass
@@ -19,6 +26,13 @@ class Segment:
     text: str
     start: float  # seconds from stream start; 0.0 if unavailable
     end: float
+
+
+class _TextSpan(NamedTuple):
+    start_char: int
+    end_char: int
+    start_ts: float
+    end_ts: float
 
 
 def build_engine(model_size: str | None = None) -> TranscriptionEngine:
@@ -43,24 +57,83 @@ def _parse_ts(t: str) -> float:
     return parts[0] * 3600 + parts[1] * 60 + parts[2]
 
 
+def _committed_speech(lines: list[dict]) -> tuple[str, list[_TextSpan]]:
+    """Return normalized committed speech text and char spans per source line."""
+    parts: list[str] = []
+    spans: list[_TextSpan] = []
+    pos = 0
+
+    for ln in lines:
+        if ln.get("speaker") == -2:
+            continue
+        text = (ln.get("text") or "").strip()
+        if not text:
+            continue
+        if parts:
+            parts.append(" ")
+            pos += 1
+        start_char = pos
+        parts.append(text)
+        pos += len(text)
+        spans.append(_TextSpan(
+            start_char=start_char,
+            end_char=pos,
+            start_ts=_parse_ts(ln.get("start", "")),
+            end_ts=_parse_ts(ln.get("end", "")),
+        ))
+
+    return "".join(parts), spans
+
+
+def _time_at(span: _TextSpan, char_pos: int) -> float:
+    if span.end_char <= span.start_char or span.end_ts <= span.start_ts:
+        return span.start_ts
+    ratio = (char_pos - span.start_char) / (span.end_char - span.start_char)
+    ratio = min(1.0, max(0.0, ratio))
+    return span.start_ts + ratio * (span.end_ts - span.start_ts)
+
+
+def _bounds_for_chars(spans: list[_TextSpan], start_char: int, end_char: int) -> tuple[float, float]:
+    if not spans:
+        return 0.0, 0.0
+
+    first = spans[0]
+    last = spans[-1]
+    for span in spans:
+        if span.end_char > start_char:
+            first = span
+            break
+    for span in reversed(spans):
+        if span.start_char < end_char:
+            last = span
+            break
+
+    return _time_at(first, start_char), _time_at(last, end_char)
+
+
+def _next_emit_end(text: str, cursor: int, finalized_end: int) -> int | None:
+    """Next committed text boundary to emit, or None if no boundary is ready."""
+    punctuation = _SENTENCE_END.search(text, cursor)
+    punct_end = punctuation.end() if punctuation else None
+    line_end = finalized_end if finalized_end > cursor else None
+
+    if line_end is not None and (punct_end is None or line_end < punct_end):
+        return line_end
+    return punct_end
+
+
 async def transcribe(
     pcm_chunks: AsyncIterable[bytes],
     engine: TranscriptionEngine | None = None,
 ) -> AsyncGenerator[Segment, None]:
     """Feed PCM chunks through the ASR and yield committed segments as they finalize.
 
-    WhisperLiveKit does NOT deliver committed text as append-only lines. Each
-    snapshot carries all lines so far; a speaker's current sentence-run is a
-    single line whose `text` grows in place (word by word) until a silence or
-    punctuation boundary starts a *new* line with a later start time. Silence
-    lines have speaker == -2 and empty text.
-
-    So we key committed speech lines by their start time, keep the latest text
-    per key, and emit a segment once it is finalized -- i.e. when a line with a
-    later start appears (the earlier one is done) or at end of stream. That
-    yields whole sentence-grouped segments, which is what the downstream
-    translator wants (not word fragments). `buffer_transcription` (the
-    uncommitted tail) is dropped.
+    WhisperLiveKit snapshots carry committed text in `lines`, while
+    `buffer_transcription` is still unstable. With diarization off, committed
+    speech often arrives as one line whose text grows for many seconds; later
+    snapshots may also add silence lines around it. Treat the speech lines as
+    one normalized committed text stream, keep a cursor into that stream, and
+    emit every punctuation-delimited or finalized-line chunk once.
     """
     engine = engine or build_engine()
     processor = AudioProcessor(transcription_engine=engine, language="ko")
@@ -76,37 +149,49 @@ async def transcribe(
             await processor.process_audio(b"")  # signal EOF -> flush + stop
 
     feeder = asyncio.create_task(feed())
-    latest: dict[float, dict] = {}  # start_ts -> newest line dict for that run
-    emitted_starts: set[float] = set()
+    emitted_prefix = ""
+    last_text = ""
+    last_spans: list[_TextSpan] = []
     try:
         async for front in results:
-            speech = [
-                ln for ln in front.to_dict().get("lines", [])
-                if ln.get("speaker") != -2 and ln.get("text", "").strip()
-            ]
-            for ln in speech:
-                latest[_parse_ts(ln.get("start", ""))] = ln
-
-            if not latest:
+            lines = front.to_dict().get("lines", [])
+            text, spans = _committed_speech(lines)
+            if not text:
                 continue
-            # Any run whose start is strictly before the newest run's start is
-            # finalized -- no more tokens will be appended to it.
-            newest_start = max(latest)
-            for start in sorted(s for s in latest if s < newest_start):
-                if start in emitted_starts:
-                    continue
-                ln = latest[start]
-                yield Segment(text=ln["text"].strip(),
-                              start=start, end=_parse_ts(ln.get("end", "")))
-                emitted_starts.add(start)
+            last_text = text
+            last_spans = spans
+
+            # Full-mode sessions should keep a stable prefix. If the backend
+            # ever rewrites or prunes earlier text, avoid indexing past the new
+            # snapshot and continue from the longest still-matching prefix.
+            while emitted_prefix and not text.startswith(emitted_prefix):
+                emitted_prefix = emitted_prefix[:-1]
+            emitted_chars = len(emitted_prefix)
+
+            finalized_end = spans[-2].end_char if len(spans) > 1 else emitted_chars
+            while True:
+                emit_end = _next_emit_end(text, emitted_chars, finalized_end)
+                if emit_end is None or emit_end <= emitted_chars:
+                    break
+                chunk = text[emitted_chars:emit_end].strip()
+                if chunk:
+                    start, end = _bounds_for_chars(spans, emitted_chars, emit_end)
+                    yield Segment(text=chunk, start=start, end=end)
+                emitted_chars = emit_end
+                emitted_prefix = text[:emitted_chars]
     finally:
         feeder.cancel()
         await processor.cleanup()
 
-    # Flush the final in-progress run(s) after the stream ends.
-    for start in sorted(latest):
-        if start in emitted_starts:
-            continue
-        ln = latest[start]
-        yield Segment(text=ln["text"].strip(),
-                      start=start, end=_parse_ts(ln.get("end", "")))
+    # A capture/feed failure (e.g. ffmpeg died) must surface here, not vanish as a
+    # silent 0-segment "clean" finish -- re-raise anything but our own cancellation.
+    try:
+        await feeder
+    except asyncio.CancelledError:
+        pass
+
+    emitted_chars = len(emitted_prefix)
+    remainder = last_text[emitted_chars:].strip()
+    if remainder:
+        start, end = _bounds_for_chars(last_spans, emitted_chars, len(last_text))
+        yield Segment(text=remainder, start=start, end=end)
