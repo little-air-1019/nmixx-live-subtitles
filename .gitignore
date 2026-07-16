@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+state.json
+.DS_Store
+*.log
+tests/*.m4a
+tests/*.wav
