@@ -11,9 +11,13 @@ Full architecture design and diagram: [ARCHITECTURE.md](ARCHITECTURE.md).
 ## Setup
 
 ```
+brew install ffmpeg streamlink yt-dlp ngrok   # external binaries, not covered by uv sync
 uv sync
 cp .env.example .env   # fill in DISCORD_WEBHOOK_URL, GEMINI_API_KEY, YOUTUBE_API_KEY, PUBLIC_BASE_URL
 ```
+
+The first ASR run downloads the Whisper model (`WHISPER_MODEL`, default `medium`); later runs
+use the local cache.
 
 `PUBLIC_BASE_URL` must be a stable HTTPS URL that YouTube's PubSubHubbub hub can reach and
 that forwards to this service's port (8080 by default, see below) -- e.g. an ngrok tunnel:
@@ -56,6 +60,21 @@ Two launch agents keep the pipeline alive across crashes, logouts, and reboots:
   Logs to `~/Library/Logs/nmixx-ngrok.log`.
 
 Both are `RunAtLoad` (start at login) + `KeepAlive` (auto-restart on crash).
+
+One-time install from templates in `deploy/` (run from the repo root on the target machine;
+use your ngrok dev domain — the free one permanently assigned to your ngrok account):
+
+```
+mkdir -p ~/Library/Logs ~/Library/LaunchAgents
+sed "s|__REPO_DIR__|$PWD|g" deploy/com.nmixx.subtitles.plist \
+  > ~/Library/LaunchAgents/com.nmixx.subtitles.plist
+sed -e "s|__HOME__|$HOME|g" -e "s|__NGROK_DOMAIN__|https://YOUR-DOMAIN.ngrok-free.app|g" \
+  deploy/com.nmixx.ngrok.plist > ~/Library/LaunchAgents/com.nmixx.ngrok.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nmixx.subtitles.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nmixx.ngrok.plist
+```
+
+After this one-time bootstrap, both services start automatically at every login.
 
 ```
 # status (PID / last exit code)
