@@ -8,6 +8,7 @@ from fastapi import FastAPI
 
 from nmixx_subtitles import config
 from nmixx_subtitles.asr import transcribe
+from nmixx_subtitles.batcher import batch_by_window
 from nmixx_subtitles.capture import pcm_stream
 from nmixx_subtitles.discord import DiscordPoster
 from nmixx_subtitles.trigger import make_router
@@ -63,14 +64,15 @@ async def run_live_job(video_id: str) -> None:
     first_line = True
     segment_count = 0
     try:
-        async for segment in transcribe(pcm_stream(video_id)):
-            zh = await translate_segment(segment.text)
-            line = zh
+        segments = transcribe(pcm_stream(video_id))
+        async for batch in batch_by_window(segments):
+            zh_lines = await translate_batch([s.text for s in batch])
+            block = "\n".join(zh_lines)
             if first_line:
-                line = f"https://www.youtube.com/watch?v={video_id}\n{zh}"
+                block = f"https://www.youtube.com/watch?v={video_id}\n{block}"
                 first_line = False
-            await poster.send(line)
-            segment_count += 1
+            await poster.send(block)
+            segment_count += len(batch)
         log.info("live job for video_id=%s ended: stream finished (%d segments)", video_id, segment_count)
         _mark(video_id, "completed")
     except Exception:
@@ -86,9 +88,9 @@ async def run_live_job(video_id: str) -> None:
         _current_video_id = None
 
 
-async def translate_segment(text: str) -> str:
-    from nmixx_subtitles.translate import translate
-    return await translate(text)
+async def translate_batch(texts: list[str]) -> list[str]:
+    from nmixx_subtitles.translate import translate_batch as _translate_batch
+    return await _translate_batch(texts)
 
 
 async def start_live_job(video_id: str) -> None:
