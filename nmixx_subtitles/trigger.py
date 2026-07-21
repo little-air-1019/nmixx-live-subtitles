@@ -5,7 +5,7 @@ from typing import Awaitable, Callable
 
 from fastapi import APIRouter, Query, Request, Response
 
-from nmixx_transcribe.config import WEBSUB_VERIFY_TOKEN, YOUTUBE_CHANNEL_ID
+from nmixx_subtitles.config import WEBSUB_VERIFY_TOKEN, YOUTUBE_CHANNEL_ID
 
 log = logging.getLogger(__name__)
 

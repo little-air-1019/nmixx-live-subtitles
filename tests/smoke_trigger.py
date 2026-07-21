@@ -9,8 +9,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import httpx
 
-from nmixx_transcribe.config import WEBSUB_VERIFY_TOKEN, YOUTUBE_CHANNEL_ID
-from nmixx_transcribe.youtube import channel_live_video_id, video_state, websub_subscribe
+from nmixx_subtitles.config import WEBSUB_VERIFY_TOKEN, YOUTUBE_CHANNEL_ID
+from nmixx_subtitles.youtube import channel_live_video_id, video_state, websub_subscribe
 
 ATOM_SAMPLE = """<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:yt="http://www.youtube.com/xml/schemas/2015">
@@ -57,7 +57,7 @@ async def item3_websub_callback():
             raise RuntimeError("boom")
         received.append(vid)
 
-    from nmixx_transcribe.trigger import make_router
+    from nmixx_subtitles.trigger import make_router
 
     app = FastAPI()
     app.include_router(make_router(on_video))
@@ -122,7 +122,7 @@ async def item3_websub_callback():
 
 
 async def item6_watchdog_timeout():
-    from nmixx_transcribe import youtube as yt_mod
+    from nmixx_subtitles import youtube as yt_mod
 
     orig_timeout = yt_mod.WATCHDOG_TIMEOUT_S
     yt_mod.WATCHDOG_TIMEOUT_S = 0.01  # force the timeout path without waiting a real 60s

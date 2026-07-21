@@ -6,7 +6,7 @@ from pathlib import Path
 from google import genai
 from google.genai import types
 
-from nmixx_transcribe.config import GEMINI_API_KEY, ROOT
+from nmixx_subtitles.config import GEMINI_API_KEY, ROOT
 
 MODEL = "gemini-3.5-flash"
 GLOSSARY_PATH = ROOT / "glossary.md"

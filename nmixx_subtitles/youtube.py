@@ -5,7 +5,7 @@ import subprocess
 
 import httpx
 
-from nmixx_transcribe.config import PUBLIC_BASE_URL, WEBSUB_VERIFY_TOKEN, YOUTUBE_API_KEY, YOUTUBE_CHANNEL_ID
+from nmixx_subtitles.config import PUBLIC_BASE_URL, WEBSUB_VERIFY_TOKEN, YOUTUBE_API_KEY, YOUTUBE_CHANNEL_ID
 
 log = logging.getLogger(__name__)
 WATCHDOG_TIMEOUT_S = 60

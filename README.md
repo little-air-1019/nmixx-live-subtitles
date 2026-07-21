@@ -1,4 +1,4 @@
-# nmixx-live-transcribe
+# nmixx-live-subtitles
 
 Watches a YouTube channel for live streams, transcribes Korean speech, translates it to
 Traditional Chinese (zh-TW), and posts subtitle lines to a Discord webhook in near real time.
@@ -26,13 +26,13 @@ between this service and the hub (the app itself owns the verification handshake
 On a Mac, prevent the machine from sleeping while the service should be watching for streams:
 
 ```
-caffeinate -i uv run uvicorn nmixx_transcribe.main:app --port 8080
+caffeinate -i uv run uvicorn nmixx_subtitles.main:app --port 8080
 ```
 
 ## Run
 
 ```
-uv run uvicorn nmixx_transcribe.main:app --port 8080
+uv run uvicorn nmixx_subtitles.main:app --port 8080
 ```
 
 On startup the service loads `state.json` (handled-video dedupe log), subscribes to the
@@ -48,7 +48,7 @@ every 60s starting ~2 minutes before their scheduled start, giving up after a 2-
 
 Two launch agents keep the pipeline alive across crashes, logouts, and reboots:
 
-- `~/Library/LaunchAgents/com.nmixx.transcribe.plist` — the service on port 8080, wrapped in
+- `~/Library/LaunchAgents/com.nmixx.subtitles.plist` — the service on port 8080, wrapped in
   `caffeinate -s` (keeps the Mac awake while on AC power). Logs to `service.log` in this repo.
 - `~/Library/LaunchAgents/com.nmixx.ngrok.plist` — the ngrok tunnel (static domain → 8080).
   Logs to `~/Library/Logs/nmixx-ngrok.log`.
@@ -60,15 +60,15 @@ Both are `RunAtLoad` (start at login) + `KeepAlive` (auto-restart on crash).
 launchctl list | grep com.nmixx
 
 # restart
-launchctl kickstart -k gui/$(id -u)/com.nmixx.transcribe
+launchctl kickstart -k gui/$(id -u)/com.nmixx.subtitles
 launchctl kickstart -k gui/$(id -u)/com.nmixx.ngrok
 
 # stop (until next login)
-launchctl bootout gui/$(id -u)/com.nmixx.transcribe
+launchctl bootout gui/$(id -u)/com.nmixx.subtitles
 launchctl bootout gui/$(id -u)/com.nmixx.ngrok
 
 # start again after a bootout
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nmixx.transcribe.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nmixx.subtitles.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nmixx.ngrok.plist
 
 # follow logs
@@ -89,5 +89,5 @@ uv run python tests/smoke_asr.py       # capture -> ASR against a local sample f
 ```
 
 Manual end-to-end check without waiting for a real stream: call
-`nmixx_transcribe.main.run_live_job(video_id_or_url_or_local_path)` directly against any
+`nmixx_subtitles.main.run_live_job(video_id_or_url_or_local_path)` directly against any
 currently-live video or a local audio file.

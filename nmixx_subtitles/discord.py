@@ -4,7 +4,7 @@ import time
 
 import httpx
 
-from nmixx_transcribe.config import DISCORD_WEBHOOK_URL
+from nmixx_subtitles.config import DISCORD_WEBHOOK_URL
 
 FLUSH_AGE_S = 4.0
 FLUSH_CHARS = 500

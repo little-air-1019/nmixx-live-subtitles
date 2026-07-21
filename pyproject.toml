@@ -1,5 +1,5 @@
 [project]
-name = "nmixx-transcribe"
+name = "nmixx-subtitles"
 version = "0.1.0"
 description = "Watch NMIXX YouTube lives, transcribe Korean, translate to zh-TW, post to Discord"
 requires-python = ">=3.11,<3.13"

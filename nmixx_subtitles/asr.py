@@ -12,7 +12,7 @@ from typing import AsyncGenerator, AsyncIterable, NamedTuple
 from whisperlivekit import AudioProcessor, TranscriptionEngine
 from whisperlivekit.config import WhisperLiveKitConfig
 
-from nmixx_transcribe import config
+from nmixx_subtitles import config
 
 # WhisperLiveKit only closes out a line on a >5s silence (its hardcoded
 # MIN_DURATION_REAL_SILENCE), so a committed speech line can keep growing for

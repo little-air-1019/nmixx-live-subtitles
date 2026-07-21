@@ -6,12 +6,12 @@ import time
 
 from fastapi import FastAPI
 
-from nmixx_transcribe import config
-from nmixx_transcribe.asr import transcribe
-from nmixx_transcribe.capture import pcm_stream
-from nmixx_transcribe.discord import DiscordPoster
-from nmixx_transcribe.trigger import make_router
-from nmixx_transcribe.youtube import channel_live_video_id, video_state, websub_subscribe
+from nmixx_subtitles import config
+from nmixx_subtitles.asr import transcribe
+from nmixx_subtitles.capture import pcm_stream
+from nmixx_subtitles.discord import DiscordPoster
+from nmixx_subtitles.trigger import make_router
+from nmixx_subtitles.youtube import channel_live_video_id, video_state, websub_subscribe
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -87,7 +87,7 @@ async def run_live_job(video_id: str) -> None:
 
 
 async def translate_segment(text: str) -> str:
-    from nmixx_transcribe.translate import translate
+    from nmixx_subtitles.translate import translate
     return await translate(text)
 
 

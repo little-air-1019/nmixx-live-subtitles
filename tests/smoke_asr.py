@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from nmixx_transcribe import capture, asr  # noqa: E402
+from nmixx_subtitles import capture, asr  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 AUDIO = HERE / "nmixx_sample.m4a"
