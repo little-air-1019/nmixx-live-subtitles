@@ -6,6 +6,8 @@ Traditional Chinese (zh-TW), and posts subtitle lines to a Discord webhook in ne
 Pipeline: YouTube WebSub push -> live/upcoming/ended classification -> audio capture ->
 Whisper (Korean) -> Gemini Flash (zh-TW) -> Discord.
 
+Full architecture design and diagram: [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Setup
 
 ```
