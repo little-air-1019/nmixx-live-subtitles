@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import AsyncGenerator
 
 SAMPLE_RATE = 16000
-CHUNK_BYTES = SAMPLE_RATE * 2 * 1  # 1 s of mono s16le
+CHUNK_BYTES = SAMPLE_RATE * 2 // 10  # 100 ms of mono s16le
 
 FFMPEG = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
 
