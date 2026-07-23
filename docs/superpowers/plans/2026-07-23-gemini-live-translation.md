@@ -53,6 +53,13 @@
 - Produces: `config.GEMINI_LIVE_MODEL: str`
 - Produces: `build_live_config(handle: str | None = None) -> types.LiveConnectConfig`
 
+> **Why `response_modalities=["AUDIO"]` even though we only read text transcripts:**
+> Google's Live Translate docs require `["AUDIO"]`; the translate model produces
+> translated *speech* and delivers the text we consume via `output_audio_transcription`.
+> `["TEXT"]` is not a supported response modality for this model, so we keep AUDIO and
+> simply never read `model_turn` audio parts. Verified against
+> https://ai.google.dev/gemini-api/docs/live-api/live-translate (2026-07).
+
 - [ ] **Step 1: Write the failing configuration test**
 
 Create `tests/test_live_translate.py` with:
@@ -254,13 +261,32 @@ git commit -m "feat: assemble finished live transcripts"
 
 ### Task 3: Stream audio and resume Gemini connections
 
+> **Concurrency contract (rewritten after adversarial review).** The naive design
+> (blocking `queue.get()` in the sender, `await sender` before cancellation, buffers
+> reused across reconnect) can **deadlock on reconnect**, **duplicate/merge transcripts**
+> across session resumption, and **never terminate after a reconnect**. The
+> implementation below fixes all of these and each fix has a dedicated test:
+>
+> - **No reconnect deadlock (F1):** the sender polls `queue.get()` with a short timeout
+>   and re-checks the `reconnect` event between ticks. It never cancels a `queue.get()`
+>   that may hold a value — cancelling such a get silently drops the item in asyncio, so
+>   racing get against an Event via `asyncio.wait` is unsafe here.
+> - **No merged fragments (F2):** `_TranscriptBuffer.clear()` drops any un-finished
+>   fragment at the start of each connection so a replayed fragment cannot concatenate
+>   onto stale text.
+> - **No duplicate finished lines (F3):** `_emit` suppresses an immediate exact-duplicate
+>   per kind, because session resumption can replay the last finished transcript.
+> - **Explicit terminal vs. reconnect (F6):** once audio EOF (`_END`) has been sent,
+>   `input_done` is set and the stream ends for good — even if the socket errors during
+>   the final drain — instead of reconnecting past real end-of-input.
+
 **Files:**
 - Modify: `nmixx_subtitles/live_translate.py`
 - Modify: `tests/test_live_translate.py`
 
 **Interfaces:**
 - Consumes: `pcm: AsyncIterable[bytes]`
-- Produces: `stream_transcripts(pcm: AsyncIterable[bytes], *, client: genai.Client | None = None) -> AsyncIterator[tuple[str, str]]`
+- Produces: `stream_transcripts(pcm: AsyncIterable[bytes], *, client: genai.Client | None = None, reconnect_delay_s: float = 1.0) -> AsyncIterator[tuple[str, str]]`
 - Emits tuples whose first element is exactly `"source"` or `"translation"` and whose second element is a finished, non-empty transcript.
 
 - [ ] **Step 1: Add fake Live API objects and failing stream checks**
@@ -340,9 +366,13 @@ def message(*, source=None, translation=None, handle=None, go_away=False):
     )
 
 
-async def chunks():
-    yield b"a" * 3_200
-    yield b"b" * 3_200
+async def chunks(n=2):
+    for i in range(n):
+        yield bytes([97 + i]) * 3_200
+
+
+async def _collect(agen):
+    return [event async for event in agen]
 
 
 async def test_stream_and_resume() -> None:
@@ -357,20 +387,14 @@ async def test_stream_and_resume() -> None:
         ]
     )
     second = FakeSession(
-        [
-            message(
-                translation=types.Transcription(text="第二句", finished=True),
-            )
-        ]
+        [message(translation=types.Transcription(text="第二句", finished=True))]
     )
     client = FakeClient([first, second])
 
     got = [
         event
         async for event in stream_transcripts(
-            chunks(),
-            client=client,
-            reconnect_delay_s=0,
+            chunks(2), client=client, reconnect_delay_s=0
         )
     ]
     assert ("source", "안녕") in got
@@ -379,6 +403,104 @@ async def test_stream_and_resume() -> None:
     assert client.aio.live.handles == [None, "resume-1"]
     assert first.sent + second.sent == [b"a" * 3_200, b"b" * 3_200]
     assert second.stream_ended
+
+
+async def test_reconnect_no_deadlock_empty_queue() -> None:
+    """F1: a GoAway on connection 1 while the sender is parked on an EMPTY queue must
+    reconnect, not hang. The whole call is bounded by wait_for; a deadlock would raise
+    TimeoutError."""
+    first = FakeSession([message(handle="h1"), message(go_away=True)])
+    second = FakeSession(
+        [message(translation=types.Transcription(text="恢復", finished=True))]
+    )
+    client = FakeClient([first, second])
+
+    async def one_late_chunk():
+        await asyncio.sleep(0.05)  # nothing queued before the reconnect
+        yield b"z" * 3_200
+
+    got = await asyncio.wait_for(
+        _collect(
+            stream_transcripts(one_late_chunk(), client=client, reconnect_delay_s=0)
+        ),
+        timeout=5.0,
+    )
+    assert ("translation", "恢復") in got
+    assert client.aio.live.handles == [None, "h1"]
+
+
+async def test_dedup_finished_across_resume() -> None:
+    """F3: resumption replays the same finished line; it must be emitted only once."""
+    first = FakeSession(
+        [
+            message(translation=types.Transcription(text="重複", finished=True), handle="h1"),
+            message(go_away=True),
+        ]
+    )
+    second = FakeSession(
+        [
+            message(translation=types.Transcription(text="重複", finished=True)),  # replayed
+            message(translation=types.Transcription(text="新句", finished=True)),
+        ]
+    )
+    client = FakeClient([first, second])
+    got = [
+        event
+        async for event in stream_transcripts(chunks(1), client=client, reconnect_delay_s=0)
+    ]
+    assert [e for e in got if e == ("translation", "重複")] == [("translation", "重複")]
+    assert ("translation", "新句") in got
+
+
+async def test_partial_cleared_on_reconnect() -> None:
+    """F2: a partial fragment from connection 1 must not concatenate onto a replayed
+    fragment after resume."""
+    first = FakeSession(
+        [
+            message(translation=types.Transcription(text="前半", finished=False), handle="h1"),
+            message(go_away=True),
+        ]
+    )
+    second = FakeSession(
+        [message(translation=types.Transcription(text="完整句", finished=True))]
+    )
+    client = FakeClient([first, second])
+    got = [
+        event
+        async for event in stream_transcripts(chunks(1), client=client, reconnect_delay_s=0)
+    ]
+    assert got.count(("translation", "完整句")) == 1
+    assert all("前半" not in text for _, text in got)
+
+
+async def test_disconnect_exception_reconnects() -> None:
+    """F4/F6: a dropped socket MID-STREAM (before EOF) reconnects with the saved handle.
+    The pcm stream stays open across the disconnect so _END is not reached on conn 1."""
+    first = FakeSession([message(handle="h1")], disconnect=True)
+    second = FakeSession(
+        [message(translation=types.Transcription(text="重連", finished=True))]
+    )
+    client = FakeClient([first, second])
+    done_reconnecting = asyncio.Event()
+
+    async def open_pcm():
+        yield b"q" * 3_200
+        await done_reconnecting.wait()
+        yield b"r" * 3_200
+
+    async def run():
+        got = []
+        async for event in stream_transcripts(
+            open_pcm(), client=client, reconnect_delay_s=0
+        ):
+            got.append(event)
+            if event == ("translation", "重連"):
+                done_reconnecting.set()
+        return got
+
+    got = await asyncio.wait_for(run(), timeout=5.0)
+    assert ("translation", "重連") in got
+    assert client.aio.live.handles == [None, "h1"]
 
 
 async def test_queue_stays_bounded() -> None:
@@ -391,7 +513,7 @@ async def test_queue_stays_bounded() -> None:
     assert [queue.get_nowait(), queue.get_nowait()] == [b"b", b"c"]
 ```
 
-Add these imports near the top:
+Add these imports near the top of the test file:
 
 ```python
 from nmixx_subtitles.live_translate import _put_latest, stream_transcripts
@@ -402,16 +524,20 @@ from nmixx_subtitles.live_translate import _put_latest, stream_transcripts
 Run:
 
 ```bash
-uv run python -c "import asyncio; from tests.test_live_translate import test_stream_and_resume, test_queue_stays_bounded; asyncio.run(test_stream_and_resume())"
+uv run python -c "import asyncio; from tests.test_live_translate import test_stream_and_resume; asyncio.run(test_stream_and_resume())"
 ```
 
-Expected: import failure for `stream_transcripts` or `_put_latest`
+Expected: import failure for `stream_transcripts` or `_put_latest`.
 
-- [ ] **Step 3: Implement the bounded producer and connection worker**
+- [ ] **Step 3: Implement the bounded producer, race-free sender, and connection worker**
 
 Add to `nmixx_subtitles/live_translate.py`:
 
 ```python
+MAX_RECONNECT_ATTEMPTS = 5
+DRAIN_TIMEOUT_S = 10.0
+SEND_POLL_S = 0.1
+
 _END = object()
 
 
@@ -452,8 +578,23 @@ async def _send_audio(
     reconnect: asyncio.Event,
     input_done: asyncio.Event,
 ) -> None:
+    """Forward queued PCM to the session until EOF (_END) or a reconnect is signalled.
+
+    Reconnect must interrupt a sender parked on an empty queue, or the reconnect path
+    deadlocks. Racing ``queue.get()`` against the event via ``asyncio.wait`` is *not*
+    safe here: cancelling a ``Queue.get()`` that concurrently received an item silently
+    drops that item (a documented asyncio behaviour). So we poll the queue with a short
+    timeout and re-check ``reconnect`` between ticks -- no get is cancelled with a value
+    in flight, so no chunk or the _END sentinel is lost.
+
+    # ponytail: 100 ms poll instead of an event-woken get; drop-oldest already tolerates
+    # <=100 ms extra queue latency, and this is the only race-free option for asyncio.Queue.
+    """
     while not reconnect.is_set():
-        chunk = await queue.get()
+        try:
+            chunk = await asyncio.wait_for(queue.get(), timeout=SEND_POLL_S)
+        except asyncio.TimeoutError:
+            continue  # nothing queued this tick; loop re-checks reconnect
         if chunk is _END:
             await session.send_realtime_input(audio_stream_end=True)
             input_done.set()
@@ -463,14 +604,29 @@ async def _send_audio(
         )
 
 
+async def _emit(
+    events: asyncio.Queue,
+    kind: str,
+    text: str | None,
+    last: dict[str, str],
+) -> None:
+    """Emit a finished transcript, suppressing an immediate exact duplicate. Session
+    resumption can replay the last finished line; dropping an exact repeat prevents the
+    duplicated subtitle the acceptance gate forbids."""
+    if text and text != last.get(kind):
+        last[kind] = text
+        await events.put((kind, text))
+
+
 async def _receive(
     session,
     events: asyncio.Queue,
     reconnect: asyncio.Event,
     state: dict[str, str | None],
     input_done: asyncio.Event,
-    source: _TranscriptBuffer,
-    translation: _TranscriptBuffer,
+    source: "_TranscriptBuffer",
+    translation: "_TranscriptBuffer",
+    last: dict[str, str],
 ) -> None:
     while not reconnect.is_set():
         saw_message = False
@@ -490,29 +646,15 @@ async def _receive(
             if not content:
                 continue
             if content.input_transcription:
-                text = source.push(content.input_transcription)
-                if text:
-                    await events.put(("source", text))
+                await _emit(events, "source", source.push(content.input_transcription), last)
             if content.output_transcription:
-                text = translation.push(content.output_transcription)
-                if text:
-                    if content.output_transcription.language_code not in (
-                        None,
-                        "zh-Hant",
-                        "zh-TW",
-                    ):
-                        log.warning(
-                            "unexpected output language=%s",
-                            content.output_transcription.language_code,
-                        )
-                    await events.put(("translation", text))
+                out = content.output_transcription
+                if out.language_code not in (None, "zh-Hant", "zh-TW"):
+                    log.warning("unexpected output language=%s", out.language_code)
+                await _emit(events, "translation", translation.push(out), last)
         if input_done.is_set():
-            for kind, buffer in (
-                ("source", source),
-                ("translation", translation),
-            ):
-                if text := buffer.flush():
-                    await events.put((kind, text))
+            await _emit(events, "source", source.flush(), last)
+            await _emit(events, "translation", translation.flush(), last)
             return
         if not saw_message:
             reconnect.set()
@@ -528,6 +670,7 @@ async def _run_connections(
     state: dict[str, str | None] = {"handle": None}
     source = _TranscriptBuffer()
     translation = _TranscriptBuffer()
+    last: dict[str, str] = {}
     failures = 0
     while True:
         reconnect = asyncio.Event()
@@ -540,52 +683,42 @@ async def _run_connections(
                 config=build_live_config(state["handle"]),
             ) as session:
                 failures = 0
+                source.clear()  # drop partial fragments carried from a dropped connection
+                translation.clear()
                 sender = asyncio.create_task(
                     _send_audio(session, audio, reconnect, input_done)
                 )
                 receiver = asyncio.create_task(
                     _receive(
-                        session,
-                        events,
-                        reconnect,
-                        state,
-                        input_done,
-                        source,
-                        translation,
+                        session, events, reconnect, state, input_done,
+                        source, translation, last,
                     )
                 )
                 done, _ = await asyncio.wait(
-                    {sender, receiver},
-                    return_when=asyncio.FIRST_COMPLETED,
+                    {sender, receiver}, return_when=asyncio.FIRST_COMPLETED
                 )
-                if receiver in done:
-                    receiver.result()
-                    await receiver
-                    await sender
-                    if input_done.is_set():
-                        return
-                else:
-                    sender.result()
+                if input_done.is_set():
+                    # Terminal: audio EOF was sent, so the whole stream is ending. Drain
+                    # the receiver's final transcripts (bounded) and stop for good -- never
+                    # reconnect past real EOF, even if the socket errors during the drain.
                     try:
-                        await asyncio.wait_for(receiver, timeout=10)
-                    except asyncio.TimeoutError:
-                        log.warning(
-                            "Gemini final transcript drain exceeded 10s; "
-                            "flushing received text"
-                        )
-                        for kind, buffer in (
-                            ("source", source),
-                            ("translation", translation),
-                        ):
-                            if text := buffer.flush():
-                                await events.put((kind, text))
+                        await asyncio.wait_for(receiver, timeout=DRAIN_TIMEOUT_S)
+                    except Exception:  # timeout or a socket error during the final drain
+                        log.warning("Gemini final transcript drain cut short; flushing")
+                        await _emit(events, "source", source.flush(), last)
+                        await _emit(events, "translation", translation.flush(), last)
                     return
+                # Not terminal. Surface a finished task's error to trigger a reconnect;
+                # otherwise this is a clean rotation -> signal both tasks and loop.
+                for task in done:
+                    task.result()  # re-raise; caught below to reconnect with saved handle
+                reconnect.set()
         except Exception:
+            if input_done.is_set():
+                return  # EOF already delivered; a late socket error is not a reconnect reason
             failures += 1
             log.exception(
-                "Gemini live connection failed (%d/%d)",
-                failures,
-                MAX_RECONNECT_ATTEMPTS,
+                "Gemini live connection failed (%d/%d)", failures, MAX_RECONNECT_ATTEMPTS
             )
             if failures >= MAX_RECONNECT_ATTEMPTS:
                 raise
@@ -594,7 +727,7 @@ async def _run_connections(
                 if task is not None and not task.done():
                     task.cancel()
             await asyncio.gather(
-                *(task for task in (sender, receiver) if task is not None),
+                *(t for t in (sender, receiver) if t is not None),
                 return_exceptions=True,
             )
         await asyncio.sleep(reconnect_delay_s)
@@ -640,6 +773,15 @@ async def stream_transcripts(
             await live_client.aio.aclose()
 ```
 
+Also add a `clear()` method to `_TranscriptBuffer` (from Task 2):
+
+```python
+    def clear(self) -> None:
+        # Drop any un-finished fragment carried over from a dropped connection so a
+        # replayed fragment after resumption cannot concatenate onto stale text.
+        self._parts.clear()
+```
+
 - [ ] **Step 4: Run all offline Live Translate checks**
 
 Add to the bottom of `tests/test_live_translate.py`:
@@ -649,6 +791,10 @@ async def main() -> None:
     test_config()
     test_transcript_buffer()
     await test_stream_and_resume()
+    await test_reconnect_no_deadlock_empty_queue()
+    await test_dedup_finished_across_resume()
+    await test_partial_cleared_on_reconnect()
+    await test_disconnect_exception_reconnects()
     await test_queue_stays_bounded()
     print("all live translation tests passed")
 
@@ -659,7 +805,7 @@ if __name__ == "__main__":
 
 Run: `uv run python tests/test_live_translate.py`
 
-Expected: `all live translation tests passed`
+Expected: `all live translation tests passed`. (An intentional `ConnectionError: scripted disconnect` traceback is logged by the F4 test's `log.exception` and is expected — the run still ends with the pass line.)
 
 - [ ] **Step 5: Commit transport and resumption**
 
@@ -947,9 +1093,15 @@ YouTube -> ffmpeg 16 kHz mono PCM/100 ms
 
 Document context-window compression, resumption handles, the ten-second queue ceiling, and explicit drop/reconnect logs.
 
-- [ ] **Step 2: Rotate compromised credentials before an online test**
+- [ ] **Step 2: Rotate compromised credentials before ANY online call**
 
-In the Google Cloud/YouTube console, revoke the old YouTube API key and create a restricted replacement for the YouTube Data API. In Discord, delete the old webhook and create a replacement. Put the new values only in the ignored `.env`.
+Do this **before** the paid smoke test in Step 3 and before any other command that can
+contact YouTube, Discord, or Gemini with the old values — not merely before deployment.
+In the Google Cloud/YouTube console, revoke the old YouTube API key and create a
+restricted replacement for the YouTube Data API. In Discord, delete the old webhook and
+create a replacement. Put the new values only in the ignored `.env`. Also review any
+existing `service.log`/shell history/CI artifacts that may already contain the old
+secret-bearing URLs; rotation invalidates them, but do not commit or copy those logs.
 
 Expected:
 
@@ -967,13 +1119,22 @@ import asyncio
 from nmixx_subtitles.capture import pcm_stream
 from nmixx_subtitles.live_translate import stream_transcripts
 
+def _has_cjk(s):
+    return any("一" <= ch <= "鿿" for ch in s)
+
 async def main():
-    count = 0
+    translations = 0
+    cjk = 0
     async for kind, text in stream_transcripts(pcm_stream("tests/nmixx_sample.m4a")):
         print(kind, text)
         if kind == "translation":
-            count += 1
-    assert count > 0, "no translated subtitles returned"
+            translations += 1
+            if _has_cjk(text):
+                cjk += 1
+    assert translations > 0, "no translated subtitles returned"
+    # Guard against silent Korean passthrough being counted as a translation: the
+    # smoke test must see actual Chinese characters, not just any translation event.
+    assert cjk > 0, "translation events contained no CJK characters (possible KR passthrough)"
 
 asyncio.run(main())
 PY
@@ -982,7 +1143,7 @@ PY
 Expected:
 
 - At least one `source` and one `translation` event.
-- Translation events contain Traditional Chinese rather than `[KR]` pass-through.
+- Translation events contain Traditional Chinese (CJK) rather than `[KR]` pass-through.
 - No queue-drop warning under normal network conditions.
 
 - [ ] **Step 4: Run the 30-minute quality gate**
