@@ -949,7 +949,7 @@ Run:
 
 ```bash
 uv run python tests/test_main_pipeline.py
-uv run python nmixx_subtitles/discord.py
+uv run python -m nmixx_subtitles.discord
 uv run python tests/test_live_translate.py
 ```
 
@@ -1027,7 +1027,7 @@ Run:
 uv sync
 uv run python tests/test_live_translate.py
 uv run python tests/test_main_pipeline.py
-uv run python nmixx_subtitles/discord.py
+uv run python -m nmixx_subtitles.discord
 uv run python -c "import nmixx_subtitles.trigger, nmixx_subtitles.youtube; print('PASS trigger imports')"
 rg -n "nmixx_subtitles\\.(asr|batcher|translate)|WHISPER_MODEL|GEMINI_MODEL|whisperlivekit|mlx.whisper" nmixx_subtitles tests pyproject.toml
 ```
@@ -1172,7 +1172,7 @@ Run:
 ```bash
 uv run python tests/test_live_translate.py
 uv run python tests/test_main_pipeline.py
-uv run python nmixx_subtitles/discord.py
+uv run python -m nmixx_subtitles.discord
 git diff --check
 git status --short
 ```

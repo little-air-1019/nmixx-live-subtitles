@@ -6,7 +6,7 @@ import httpx
 
 from nmixx_subtitles.config import DISCORD_WEBHOOK_URL
 
-FLUSH_AGE_S = 4.0
+FLUSH_AGE_S = 1.0
 FLUSH_CHARS = 500
 DISCORD_MAX_CHARS = 2000
 
