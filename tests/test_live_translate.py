@@ -259,6 +259,54 @@ async def test_disconnect_exception_reconnects() -> None:
     assert client.aio.live.handles == [None, "h1"]
 
 
+class EofFailSession:
+    """A session whose socket dies exactly when the audio-stream-end marker is sent:
+    send_realtime_input(audio_stream_end=True) raises, and receive() then also raises
+    (dead socket). This is the realistic shape of the EOF/disconnect race."""
+
+    def __init__(self, messages):
+        self.messages = list(messages)
+        self.sent: list[bytes] = []
+        self.dead = False
+
+    async def send_realtime_input(self, *, audio=None, audio_stream_end=None):
+        await asyncio.sleep(0)
+        if audio is not None:
+            self.sent.append(audio.data)
+        if audio_stream_end:
+            self.dead = True
+            raise ConnectionError("socket dropped exactly at EOF")
+
+    async def receive(self):
+        while self.messages:
+            yield self.messages.pop(0)
+        while not self.dead:
+            await asyncio.sleep(0)
+        raise ConnectionError("dead socket")
+
+
+async def test_eof_send_failure_terminates() -> None:
+    """Regression: if the socket drops while sending audio_stream_end, the _END sentinel
+    has already been consumed. The stream must still terminate (delivering transcripts it
+    already had) and must NOT reconnect to a sender that would wait forever on an empty
+    queue. A bounded wait_for makes a hang surface as TimeoutError; a spurious reconnect
+    would exhaust the single fake session."""
+    session = EofFailSession(
+        [message(translation=types.Transcription(text="你好", finished=True))]
+    )
+    client = FakeClient([session])
+
+    async def one_chunk():
+        yield b"a" * 3_200
+
+    got = await asyncio.wait_for(
+        _collect(stream_transcripts(one_chunk(), client=client, reconnect_delay_s=0)),
+        timeout=4.0,
+    )
+    assert ("translation", "你好") in got
+    assert client.aio.live.handles == [None]  # no reconnect past EOF
+
+
 async def test_queue_stays_bounded() -> None:
     dropped = []
     queue = asyncio.Queue(maxsize=2)
@@ -277,6 +325,7 @@ async def main() -> None:
     await test_dedup_finished_across_resume()
     await test_partial_cleared_on_reconnect()
     await test_disconnect_exception_reconnects()
+    await test_eof_send_failure_terminates()
     await test_queue_stays_bounded()
     print("all live translation tests passed")
 

@@ -115,8 +115,12 @@ async def _send_audio(
         except asyncio.TimeoutError:
             continue  # nothing queued this tick; loop re-checks reconnect
         if chunk is _END:
-            await session.send_realtime_input(audio_stream_end=True)
+            # Mark terminal BEFORE the send: pulling _END means input has logically ended,
+            # and the shared queue's only _END sentinel is now consumed. If the send raises
+            # (socket drops at EOF), _run_connections must still see input_done and finish
+            # instead of reconnecting to a sender that would wait forever on an empty queue.
             input_done.set()
+            await session.send_realtime_input(audio_stream_end=True)
             return
         await session.send_realtime_input(
             audio=types.Blob(data=chunk, mime_type=AUDIO_MIME)

@@ -1,23 +1,26 @@
 # nmixx-live-subtitles
 
-Watches a YouTube channel for live streams, transcribes Korean speech, translates it to
-Traditional Chinese (zh-TW), and posts subtitle lines to a Discord webhook in near real time.
+Watches a YouTube channel for live streams, translates the Korean speech to Traditional
+Chinese (zh-TW), and posts subtitle lines to a Discord webhook in near real time.
 
-Pipeline: YouTube WebSub push -> live/upcoming/ended classification -> audio capture ->
-Whisper (Korean) -> Gemini Flash (zh-TW) -> Discord.
+Pipeline: YouTube WebSub push -> live/upcoming/ended classification -> ffmpeg 16 kHz mono
+PCM in 100 ms chunks -> Gemini Live Translate (zh-Hant) -> Discord.
+
+Translation runs as a single Gemini Live Translate WebSocket stream (`GEMINI_LIVE_MODEL`,
+default `gemini-3.5-live-translate-preview`) -- audio goes in, translated Traditional
+Chinese text comes out, with no separate ASR or text-translation step. Note this is a
+**Preview** model; a two-hour live stream costs roughly **$4.42 USD** (~$0.0368/audio
+minute, billed by stream duration, not speaking time).
 
 Full architecture design and diagram: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Setup
 
 ```
-brew install ffmpeg streamlink yt-dlp ngrok   # external binaries, not covered by uv sync
+brew install ffmpeg yt-dlp ngrok   # external binaries, not covered by uv sync
 uv sync
 cp .env.example .env   # fill in DISCORD_WEBHOOK_URL, GEMINI_API_KEY, YOUTUBE_API_KEY, PUBLIC_BASE_URL
 ```
-
-The first ASR run downloads the Whisper model (`WHISPER_MODEL`, default `medium`); later runs
-use the local cache.
 
 `PUBLIC_BASE_URL` must be a stable HTTPS URL that YouTube's PubSubHubbub hub can reach and
 that forwards to this service's port (8080 by default, see below) -- e.g. an ngrok tunnel:
@@ -46,8 +49,8 @@ channel's WebSub feed, and starts a renewal loop (re-subscribes every ~4 days, a
 hub's 5-day lease) plus a watchdog loop (polls the channel's `/live` URL every 10 minutes as
 a backstop in case a WebSub push is missed).
 
-When a video goes live, the service captures audio, transcribes it, translates each segment,
-and posts it to Discord -- one live stream at a time. Upcoming (scheduled) streams are polled
+When a video goes live, the service captures audio, streams it to Gemini Live Translate, and
+posts the translated lines to Discord -- one live stream at a time. Upcoming (scheduled) streams are polled
 every 60s starting ~2 minutes before their scheduled start, giving up after a 2-hour window.
 
 ## Running as a launchd service (survives reboots)
@@ -105,10 +108,16 @@ within ~10 minutes. Streams that happen while the Mac is off are simply missed.
 ## Test
 
 ```
-uv run python tests/smoke_trigger.py   # WebSub + videos.list + watchdog against real APIs
-uv run python tests/smoke_asr.py       # capture -> ASR against a local sample file
+uv run python tests/smoke_trigger.py         # WebSub + videos.list + watchdog against real APIs
+uv run python tests/test_live_translate.py   # Gemini Live Translate stream, offline checks
+uv run python tests/test_main_pipeline.py    # pipeline wiring, offline checks
+uv run python -m nmixx_subtitles.discord     # Discord poster, offline checks
 ```
 
 Manual end-to-end check without waiting for a real stream: call
 `nmixx_subtitles.main.run_live_job(video_id_or_url_or_local_path)` directly against any
 currently-live video or a local audio file.
+
+`glossary.md` is now a manual human quality checklist (member names, slang, lore terms) for
+reviewers to check subtitles against -- the Live Translate model doesn't accept a custom
+prompt or glossary, so nothing from it is injected at translation time.

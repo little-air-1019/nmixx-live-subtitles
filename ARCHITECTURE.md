@@ -8,7 +8,7 @@ flowchart TB
     subgraph EXT["外部服務"]
         YT["YouTube<br/>(NMIXX channel)"]
         HUB["WebSub Hub<br/>(pubsubhubbub)"]
-        GEMINI["Gemini API<br/>(GEMINI_MODEL, 預設 flash-lite)"]
+        GEMINI["Gemini Live Translate<br/>(GEMINI_LIVE_MODEL,<br/>預設 gemini-3.5-live-translate-preview)"]
         DC["Discord Webhook"]
     end
 
@@ -25,11 +25,9 @@ flowchart TB
             end
 
             subgraph PIPE["Pipeline: run_live_job(video_id)"]
-                CAP["capture.py<br/>streamlink(退回 yt-dlp) + ffmpeg<br/>→ 16kHz mono PCM, 1 秒 chunks"]
-                ASR["asr.py<br/>WhisperLiveKit + mlx-whisper(本機, WHISPER_MODEL=medium)<br/>→ 韓文 Segment(斷句後 commit)"]
-                BAT["batcher.py<br/>4 秒視窗收集 segments"]
-                TR["translate.py<br/>整批一次 Gemini call<br/>system prompt = 規則 + glossary.md<br/>context deque(近 4 句原文)"]
-                POST["discord.py DiscordPoster<br/>緩衝 4 秒/500 字後送出"]
+                CAP["capture.py<br/>yt-dlp + ffmpeg<br/>→ 16kHz mono s16le PCM, 100ms/3200 bytes chunks"]
+                LIVE["live_translate.py<br/>Gemini Live Translate WebSocket<br/>10 秒上限音訊佇列(塞爆丟最舊、記錄丟棄秒數)<br/>context-window compression + session resumption<br/>斷線/GoAway 用 resumption handle 重連<br/>→ output_audio_transcription(zh-Hant)"]
+                POST["discord.py DiscordPoster<br/>緩衝 1 秒後送出"]
             end
 
             ST[("state.json<br/>video_id → status/attempt")]
@@ -44,8 +42,8 @@ flowchart TB
     OV -- "live" --> PIPE
     OV -- "upcoming" --> UP -- "轉 live" --> PIPE
     OV <--> ST
-    YT -- "HLS 音訊" --> CAP --> ASR --> BAT --> TR --> POST --> DC
-    TR <--> GEMINI
+    YT -- "HLS 音訊" --> CAP --> LIVE --> POST --> DC
+    LIVE <--> GEMINI
     RESUB --> HUB
 ```
 
@@ -64,13 +62,26 @@ YouTube 有新影片/開播就 push 到 `POST /youtube/websub`（經 ngrok 進�
 ## Pipeline（run_live_job，直播期間持續執行）
 
 ```
-streamlink/ffmpeg → 1s PCM chunks → WhisperLiveKit(本機 Whisper) → 韓文句子
-→ 4 秒 micro-batch → Gemini 一次翻整批(glossary 進 system prompt)
-→ DiscordPoster 緩衝(4s/500 字) → webhook
+yt-dlp + ffmpeg → 100ms PCM chunks(16kHz mono s16le)
+→ Gemini Live Translate WebSocket(zh-Hant, response_modalities=["AUDIO"])
+→ output_audio_transcription(已完成的翻譯句)
+→ DiscordPoster 緩衝(1s) → webhook
 ```
 
-成本設計：ASR 全本機不花錢；翻譯靠 micro-batch 把 API 呼叫壓到約每分鐘 2–5 次，
-model 由 `GEMINI_MODEL` env 控制。翻譯失敗或行數不符時 fallback 成 `[KR] 原文`，永不中斷 job。
+只有一個階段：音訊進、zh-Hant 文字出，沒有本機 ASR，也沒有另外一次文字翻譯 call。
+model 由 `GEMINI_LIVE_MODEL` env 控制（預設 `gemini-3.5-live-translate-preview`，屬 Preview
+模型）。雖然只取文字稿，但這顆模型要求 `response_modalities=["AUDIO"]` 才會產生
+`output_audio_transcription`。
+
+成本設計：Google 依音訊時長計費（非實際講話時間），約 $0.0368/分鐘，兩小時直播單一目標語言
+約 **$4.42 USD**。
+
+韌性（`live_translate.py`）：音訊佇列上限 **10 秒**，API 卡住時丟棄最舊的音訊而非無限堆積
+（保住即時性），並記錄實際丟棄的秒數；靠 **context-window compression** 與
+**session resumption** 撐過 Google WebSocket 每 ~10 分鐘的輪替、以及未壓縮音訊 session 的
+15 分鐘上限；遇到 GoAway 或斷線就用先前存下的 resumption handle 重連；重連時會清掉未完成的
+片段、並對重播的已完成句子去重，避免字幕被截斷合併或重複貼出。API/socket/語言/佇列丟棄等
+錯誤一律記錄下來，絕不會靜默 fallback 回韓文原文。
 
 ## 狀態與韌性
 
@@ -84,6 +95,7 @@ model 由 `GEMINI_MODEL` env 控制。翻譯失敗或行數不符時 fallback �
 
 ## 設定
 
-`.env`：`DISCORD_WEBHOOK_URL`、`GEMINI_API_KEY`、`GEMINI_MODEL`、`YOUTUBE_API_KEY`、
-`PUBLIC_BASE_URL`（ngrok 網址）、`WEBSUB_VERIFY_TOKEN`、`YOUTUBE_CHANNEL_ID`、`WHISPER_MODEL`。
-自訂翻譯對照（成員名/slang/世界觀術語）改 `glossary.md` 即可，整份會進每次翻譯的 system prompt。
+`.env`：`DISCORD_WEBHOOK_URL`、`GEMINI_API_KEY`、`GEMINI_LIVE_MODEL`、`YOUTUBE_API_KEY`、
+`PUBLIC_BASE_URL`（ngrok 網址）、`WEBSUB_VERIFY_TOKEN`、`YOUTUBE_CHANNEL_ID`。
+`glossary.md` 現在是人工品質檢查清單（成員名/slang/世界觀術語），供人工複核字幕用——
+Live Translate 模型不接受自訂 prompt 或 glossary，所以內容不會被注入翻譯過程。
