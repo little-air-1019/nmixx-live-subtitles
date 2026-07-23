@@ -1,9 +1,10 @@
 """Audio capture: YouTube live/VOD or a local file -> 16 kHz mono s16le PCM.
 
-Spawns streamlink (falling back to yt-dlp) to pull the stream, pipes it
-through ffmpeg to raw PCM, and yields fixed-size chunks off an asyncio stream.
+Spawns yt-dlp to pull the stream, pipes it through ffmpeg to raw PCM, and
+yields fixed-size chunks off an asyncio stream.
 """
 import asyncio
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -13,6 +14,8 @@ SAMPLE_RATE = 16000
 CHUNK_BYTES = SAMPLE_RATE * 2 * 1  # 1 s of mono s16le
 
 FFMPEG = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+
+_log = logging.getLogger(__name__)
 
 
 def _is_local_file(source: str) -> bool:
@@ -34,7 +37,7 @@ async def _drain_stderr(proc: asyncio.subprocess.Process, name: str) -> None:
         line = await proc.stderr.readline()
         if not line:
             break
-        # ponytail: swallow child logs; flip to logging if you need to debug pulls.
+        _log.debug("[%s] %s", name, line.decode(errors="replace").rstrip())
 
 
 async def _spawn_local_ffmpeg(path: str) -> asyncio.subprocess.Process:
@@ -60,33 +63,20 @@ async def _spawn_stream_pipeline(source: str) -> tuple[asyncio.subprocess.Proces
         # fetches; upgrade yt-dlp and drop this once that's fixed upstream.
         return ["yt-dlp", "-f", "bestaudio/best", "-o", "-", "--extractor-args", "youtube:player_client=android", url]
 
+    # streamlink's YouTube plugin misclassifies these live URLs as VOD and exits 1
+    # immediately, poisoning ffmpeg's pipe (a race that surfaced as flaky
+    # "capture puller exited 1"). yt-dlp handles YouTube live reliably, so use it
+    # directly rather than trying streamlink first and racing on the fallback.
+    if not shutil.which("yt-dlp"):
+        raise RuntimeError("yt-dlp not found on PATH")
+
     # asyncio.subprocess can't wire one child's StreamReader directly into another
     # child's stdin (it needs a real fd) -> use an actual OS pipe between them.
     r_fd, w_fd = os.pipe()
     try:
-        if shutil.which("streamlink"):
-            puller = await asyncio.create_subprocess_exec(
-                "streamlink", "--stdout", "--default-stream", "best", url,
-                stdout=w_fd, stderr=asyncio.subprocess.PIPE,
-            )
-            # streamlink can reject a URL outright (e.g. misclassifies it as VOD) and exit
-            # immediately instead of streaming -- fall back to yt-dlp for this pull rather
-            # than silently handing ffmpeg an empty pipe. Poll briefly instead of one fixed
-            # sleep since process startup time varies.
-            for _ in range(20):
-                if puller.returncode is not None:
-                    break
-                await asyncio.sleep(0.1)
-            if puller.returncode not in (None, 0) and shutil.which("yt-dlp"):
-                puller = await asyncio.create_subprocess_exec(
-                    *_yt_dlp_cmd(), stdout=w_fd, stderr=asyncio.subprocess.PIPE,
-                )
-        elif shutil.which("yt-dlp"):
-            puller = await asyncio.create_subprocess_exec(
-                *_yt_dlp_cmd(), stdout=w_fd, stderr=asyncio.subprocess.PIPE,
-            )
-        else:
-            raise RuntimeError("neither streamlink nor yt-dlp found on PATH")
+        puller = await asyncio.create_subprocess_exec(
+            *_yt_dlp_cmd(), stdout=w_fd, stderr=asyncio.subprocess.PIPE,
+        )
 
         ffmpeg = await asyncio.create_subprocess_exec(
             FFMPEG, "-nostdin", "-i", "pipe:0",
