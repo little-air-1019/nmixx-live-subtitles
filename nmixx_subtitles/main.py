@@ -1,4 +1,4 @@
-"""Glue: WebSub trigger -> capture -> ASR -> translate -> Discord, as one live-at-a-time job."""
+"""Glue: WebSub trigger -> capture -> Gemini Live Translate -> Discord."""
 import asyncio
 import json
 import logging
@@ -7,14 +7,18 @@ import time
 from fastapi import FastAPI
 
 from nmixx_subtitles import config
-from nmixx_subtitles.asr import transcribe
-from nmixx_subtitles.batcher import batch_by_window
 from nmixx_subtitles.capture import pcm_stream
 from nmixx_subtitles.discord import DiscordPoster
+from nmixx_subtitles.live_translate import stream_transcripts
 from nmixx_subtitles.trigger import make_router
 from nmixx_subtitles.youtube import channel_live_video_id, video_state, websub_subscribe
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# httpx/httpcore INFO logs echo full request URLs, which for the YouTube API and Discord
+# webhook carry secrets in the query string / path. Keep them at WARNING so those secrets
+# never land in service.log. Application logs (reconnects, drops, transcripts) stay at INFO.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 RESUBSCRIBE_INTERVAL_S = 4 * 24 * 3600  # renew comfortably before the hub's 5-day lease expires
@@ -64,15 +68,16 @@ async def run_live_job(video_id: str) -> None:
     first_line = True
     segment_count = 0
     try:
-        segments = transcribe(pcm_stream(video_id))
-        async for batch in batch_by_window(segments):
-            zh_lines = await translate_batch([s.text for s in batch])
-            block = "\n".join(zh_lines)
+        async for kind, text in stream_transcripts(pcm_stream(video_id)):
+            if kind == "source":
+                log.info("source transcript video_id=%s: %s", video_id, text)
+                continue
+            log.info("translation video_id=%s: %s", video_id, text)
             if first_line:
-                block = f"https://www.youtube.com/watch?v={video_id}\n{block}"
+                text = f"https://www.youtube.com/watch?v={video_id}\n{text}"
                 first_line = False
-            await poster.send(block)
-            segment_count += len(batch)
+            await poster.send(text)
+            segment_count += 1
         log.info("live job for video_id=%s ended: stream finished (%d segments)", video_id, segment_count)
         _mark(video_id, "completed")
     except Exception:
@@ -86,11 +91,6 @@ async def run_live_job(video_id: str) -> None:
         await poster.close()
         _current_job = None
         _current_video_id = None
-
-
-async def translate_batch(texts: list[str]) -> list[str]:
-    from nmixx_subtitles.translate import translate_batch as _translate_batch
-    return await _translate_batch(texts)
 
 
 async def start_live_job(video_id: str) -> None:
