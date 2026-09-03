@@ -14,6 +14,7 @@ AUDIO_MIME = "audio/pcm;rate=16000"
 QUEUE_SECONDS = 10
 CHUNKS_PER_SECOND = 10
 QUEUE_CHUNKS = QUEUE_SECONDS * CHUNKS_PER_SECOND
+PCM_BYTES_PER_SECOND = 16_000 * 2
 MAX_RECONNECT_ATTEMPTS = 5
 DRAIN_TIMEOUT_S = 10.0
 SEND_POLL_S = 0.1
@@ -41,26 +42,6 @@ def build_live_config(handle: str | None = None) -> types.LiveConnectConfig:
     )
 
 
-class _TranscriptBuffer:
-    def __init__(self) -> None:
-        self._parts: list[str] = []
-
-    def push(self, transcript: types.Transcription) -> str | None:
-        if transcript.text:
-            self._parts.append(transcript.text)
-        return self.flush() if transcript.finished else None
-
-    def flush(self) -> str | None:
-        text = "".join(self._parts).strip()
-        self._parts.clear()
-        return text or None
-
-    def clear(self) -> None:
-        # Drop any un-finished fragment carried over from a dropped connection so a
-        # replayed fragment after resumption cannot concatenate onto stale text.
-        self._parts.clear()
-
-
 async def _put_latest(
     queue: asyncio.Queue,
     item,
@@ -77,6 +58,9 @@ async def _pump_audio(
     queue: asyncio.Queue,
 ) -> None:
     dropped_chunks = 0
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    audio_seconds = 0.0
 
     def record_drop(count: int) -> None:
         nonlocal dropped_chunks
@@ -89,6 +73,10 @@ async def _pump_audio(
 
     async for chunk in pcm:
         await _put_latest(queue, chunk, record_drop)
+        audio_seconds += len(chunk) / PCM_BYTES_PER_SECOND
+        delay = audio_seconds - (loop.time() - started_at)
+        if delay > 0:
+            await asyncio.sleep(delay)
     await queue.put(_END)
 
 
@@ -131,13 +119,10 @@ async def _emit(
     events: asyncio.Queue,
     kind: str,
     text: str | None,
-    last: dict[str, str],
 ) -> None:
-    """Emit a finished transcript, suppressing an immediate exact duplicate. Session
-    resumption can replay the last finished line; dropping an exact repeat prevents the
-    duplicated subtitle the acceptance gate forbids."""
-    if text and text != last.get(kind):
-        last[kind] = text
+    # Transcriptions are streamed deltas. Preserve their whitespace and order; Google
+    # does not guarantee that the optional ``finished`` field will be populated.
+    if text:
         await events.put((kind, text))
 
 
@@ -147,9 +132,6 @@ async def _receive(
     reconnect: asyncio.Event,
     state: dict[str, str | None],
     input_done: asyncio.Event,
-    source: _TranscriptBuffer,
-    translation: _TranscriptBuffer,
-    last: dict[str, str],
 ) -> None:
     while not reconnect.is_set():
         saw_message = False
@@ -169,15 +151,13 @@ async def _receive(
             if not content:
                 continue
             if content.input_transcription:
-                await _emit(events, "source", source.push(content.input_transcription), last)
+                await _emit(events, "source", content.input_transcription.text)
             if content.output_transcription:
                 out = content.output_transcription
                 if out.language_code not in (None, "zh-Hant", "zh-TW"):
                     log.warning("unexpected output language=%s", out.language_code)
-                await _emit(events, "translation", translation.push(out), last)
+                await _emit(events, "translation", out.text)
         if input_done.is_set():
-            await _emit(events, "source", source.flush(), last)
-            await _emit(events, "translation", translation.flush(), last)
             return
         if not saw_message:
             reconnect.set()
@@ -191,9 +171,6 @@ async def _run_connections(
     reconnect_delay_s: float,
 ) -> None:
     state: dict[str, str | None] = {"handle": None}
-    source = _TranscriptBuffer()
-    translation = _TranscriptBuffer()
-    last: dict[str, str] = {}
     failures = 0
     while True:
         reconnect = asyncio.Event()
@@ -206,16 +183,11 @@ async def _run_connections(
                 config=build_live_config(state["handle"]),
             ) as session:
                 failures = 0
-                source.clear()  # drop partial fragments carried from a dropped connection
-                translation.clear()
                 sender = asyncio.create_task(
                     _send_audio(session, audio, reconnect, input_done)
                 )
                 receiver = asyncio.create_task(
-                    _receive(
-                        session, events, reconnect, state, input_done,
-                        source, translation, last,
-                    )
+                    _receive(session, events, reconnect, state, input_done)
                 )
                 done, _ = await asyncio.wait(
                     {sender, receiver}, return_when=asyncio.FIRST_COMPLETED
@@ -227,9 +199,7 @@ async def _run_connections(
                     try:
                         await asyncio.wait_for(receiver, timeout=DRAIN_TIMEOUT_S)
                     except Exception:  # timeout or a socket error during the final drain
-                        log.warning("Gemini final transcript drain cut short; flushing")
-                        await _emit(events, "source", source.flush(), last)
-                        await _emit(events, "translation", translation.flush(), last)
+                        log.warning("Gemini final transcript drain cut short")
                     return
                 # Not terminal. Surface a finished task's error to trigger a reconnect;
                 # otherwise this is a clean rotation -> signal both tasks and loop.

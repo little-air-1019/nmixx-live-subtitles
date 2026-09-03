@@ -1,5 +1,6 @@
 """Coalescing Discord webhook poster for streamed subtitle lines."""
 import asyncio
+import re
 import time
 
 import httpx
@@ -9,10 +10,13 @@ from nmixx_subtitles.config import DISCORD_WEBHOOK_URL
 FLUSH_AGE_S = 1.0
 FLUSH_CHARS = 500
 DISCORD_MAX_CHARS = 2000
+SENTENCE_END = re.compile(
+    r"[。！？…]+[」』”’）》】)\]]*|[.!?]+[\"'”’」』）》】)\]]*(?=\s|$)"
+)
 
 
 class DiscordPoster:
-    """Buffers subtitle lines and posts them to a Discord webhook in batches."""
+    """Buffers subtitle fragments and posts them to a Discord webhook."""
 
     def __init__(self, webhook_url: str = DISCORD_WEBHOOK_URL):
         if not webhook_url or not webhook_url.startswith(("http://", "https://")):
@@ -29,18 +33,36 @@ class DiscordPoster:
         # so constructing a DiscordPoster outside a running event loop doesn't raise.
         self._flush_task: asyncio.Task | None = None
 
-    async def send(self, line: str) -> None:
+    async def send(self, fragment: str) -> None:
         if self._closed:
             raise RuntimeError("DiscordPoster.send() called after close()")
         if self._flush_task is None:
             self._flush_task = asyncio.create_task(self._age_watcher())
         async with self._lock:
-            self._buf.append(line)
-            self._buf_chars += len(line) + 1  # +1 for join separator
-            if self._buf_started is None:
-                self._buf_started = time.monotonic()
-            if self._buf_chars >= FLUSH_CHARS:
-                await self._flush_locked()
+            start = 0
+            for boundary in SENTENCE_END.finditer(fragment):
+                part = fragment[start:boundary.end()]
+                self._buf.append(part)
+                self._buf_chars += len(part)
+                if self._buf_started is None:
+                    self._buf_started = time.monotonic()
+                try:
+                    await self._flush_locked()
+                except Exception:
+                    suffix = fragment[boundary.end():]
+                    if suffix:
+                        self._buf.append(suffix)
+                        self._buf_chars += len(suffix)
+                    raise
+                start = boundary.end()
+            tail = fragment[start:]
+            if tail:
+                self._buf.append(tail)
+                self._buf_chars += len(tail)
+                if self._buf_started is None:
+                    self._buf_started = time.monotonic()
+                if self._buf_chars >= FLUSH_CHARS:
+                    await self._flush_locked()
 
     async def close(self) -> None:
         self._closed = True
@@ -52,7 +74,7 @@ class DiscordPoster:
         await self._client.aclose()
 
     async def _age_watcher(self) -> None:
-        # ponytail: polling loop instead of per-buffer deadline scheduling; fine at ~1s granularity for 4s flush window.
+        # ponytail: polling is simpler than per-buffer deadline scheduling and precise enough here.
         while not self._stop.is_set():
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=0.5)
@@ -67,11 +89,11 @@ class DiscordPoster:
                         pass
 
     async def _flush_locked(self) -> None:
-        """Caller must hold self._lock. Only removes delivered lines from the buffer;
-        undelivered lines are put back so a POST failure never loses text."""
+        """Caller must hold self._lock. Only removes delivered fragments from the buffer;
+        undelivered fragments are put back so a POST failure never loses text."""
         if not self._buf:
             return
-        text = "\n".join(self._buf)
+        text = "".join(self._buf)
         chunks = _split_chunks(text, DISCORD_MAX_CHARS)
         for i, chunk in enumerate(chunks):
             try:
@@ -150,15 +172,62 @@ if __name__ == "__main__":
             pass
 
     async def main():
-        # Test 1: lines batch together under age/char thresholds
+        # Test 1: fragments batch together under age/char thresholds
         poster = DiscordPoster("http://fake")
         poster._client = FakeClient()
         await poster.send("line1")
         await poster.send("line2")
         await poster.send("line3")
         await poster.close()
-        assert poster._client.posts == ["line1\nline2\nline3"], poster._client.posts
+        assert poster._client.posts == ["line1line2line3"], poster._client.posts
         print("test1 (coalesce small lines) ok:", poster._client.posts)
+
+        # Test 1b: streamed translation fragments stay joined and sentence punctuation
+        # flushes immediately instead of waiting for an arbitrary wall-clock boundary.
+        poster = DiscordPoster("http://fake")
+        poster._client = FakeClient()
+        await poster.send("海")
+        await poster.send("嫄姐姐")
+        await poster.send("好！")
+        assert poster._client.posts == ["海嫄姐姐好！"], poster._client.posts
+        await poster.close()
+        print("test1b (join fragments and flush sentence) ok")
+
+        # Test 1c: English code-switch sentence punctuation is also a boundary.
+        poster = DiscordPoster("http://fake")
+        poster._client = FakeClient()
+        await poster.send("Hello world.")
+        assert poster._client.posts == ["Hello world."], poster._client.posts
+        await poster.close()
+        print("test1c (flush English sentence) ok")
+
+        # Test 1d: a complete sentence inside a larger API chunk flushes while the
+        # unfinished tail stays buffered for the next chunk.
+        poster = DiscordPoster("http://fake")
+        poster._client = FakeClient()
+        await poster.send("第一句。第二")
+        assert poster._client.posts == ["第一句。"], poster._client.posts
+        await poster.close()
+        assert poster._client.posts == ["第一句。", "第二"], poster._client.posts
+        print("test1d (flush punctuation inside fragment) ok")
+
+        # Test 1e: periods inside the first-message YouTube URL are not boundaries.
+        poster = DiscordPoster("http://fake")
+        poster._client = FakeClient()
+        first_message = "https://www.youtube.com/watch?v=abcdefghijk\n大家好。"
+        await poster.send(first_message)
+        assert poster._client.posts == [first_message], poster._client.posts
+        await poster.close()
+        print("test1e (preserve URL periods) ok")
+
+        # Test 1f: trailing quotes/brackets stay attached to the sentence punctuation.
+        poster = DiscordPoster("http://fake")
+        poster._client = FakeClient()
+        await poster.send("她說：「好。」下一句")
+        assert poster._client.posts == ["她說：「好。」"], poster._client.posts
+        await poster.close()
+        assert poster._client.posts == ["她說：「好。」", "下一句"], poster._client.posts
+        print("test1f (keep closing quote with sentence) ok")
 
         # Test 2: 500-char flush triggers mid-stream
         poster = DiscordPoster("http://fake")
@@ -168,7 +237,7 @@ if __name__ == "__main__":
         await poster.send("c" * 10)
         await poster.close()
         assert len(poster._client.posts) == 2, poster._client.posts
-        assert poster._client.posts[0] == "a" * 300 + "\n" + "b" * 300
+        assert poster._client.posts[0] == "a" * 300 + "b" * 300
         assert poster._client.posts[1] == "c" * 10
         print("test2 (500-char flush) ok:", [len(p) for p in poster._client.posts])
 
@@ -227,6 +296,21 @@ if __name__ == "__main__":
         assert poster._client.posts, "watcher should have retried and delivered the line"
         await poster.close()
         print("test5b (watcher survives flush exception) ok")
+
+        # Test 5c: a failed punctuation flush retains the unprocessed suffix from the
+        # same API fragment, not just the sentence that was being posted.
+        poster = DiscordPoster("http://fake")
+        poster._client = FakeClient(script=[httpx.ConnectError("boom")])
+        try:
+            await poster.send("第一句。第二句")
+            assert False, "expected exception"
+        except httpx.ConnectError:
+            pass
+        assert "".join(poster._buf) == "第一句。第二句", poster._buf
+        poster._client.script = []
+        await poster.close()
+        assert poster._client.posts[-1] == "第一句。第二句", poster._client.posts
+        print("test5c (failed boundary flush retains suffix) ok")
 
         # Test 6: 429 with null/non-numeric retry_after falls back to a default delay instead of crashing
         poster = DiscordPoster("http://fake")

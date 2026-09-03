@@ -3,6 +3,7 @@ uv run python tests/test_live_translate.py
 """
 import asyncio
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -11,7 +12,7 @@ from google.genai import types
 
 from nmixx_subtitles import capture, config
 from nmixx_subtitles.live_translate import (
-    _TranscriptBuffer,
+    _pump_audio,
     _put_latest,
     build_live_config,
     stream_transcripts,
@@ -33,21 +34,6 @@ def test_config() -> None:
 
     resumed = build_live_config("resume-token")
     assert resumed.session_resumption.handle == "resume-token"
-
-
-def test_transcript_buffer() -> None:
-    buf = _TranscriptBuffer()
-    assert buf.push(types.Transcription(text="海", finished=False)) is None
-    assert buf.push(types.Transcription(text="嫄姐姐", finished=False)) is None
-    assert buf.push(types.Transcription(text="好", finished=True)) == "海嫄姐姐好"
-    assert buf.flush() is None
-
-    assert buf.push(types.Transcription(text="  第二句  ", finished=True)) == "第二句"
-    assert buf.push(types.Transcription(text=None, finished=True)) is None
-
-    assert buf.push(types.Transcription(text="連線前半句", finished=False)) is None
-    buf.clear()  # a dropped connection clears the partial instead of flushing it
-    assert buf.flush() is None
 
 
 class FakeSession:
@@ -161,6 +147,68 @@ async def test_stream_and_resume() -> None:
     assert second.stream_ended
 
 
+async def test_transcript_without_finished_flag_emits_while_stream_is_open() -> None:
+    """Live Translate chunks must not wait for optional ``finished=True``.
+
+    Google's reference client displays every non-empty transcription chunk, and real
+    responses may leave ``finished`` unset. Holding such a chunk until EOF makes a live
+    subtitle arrive minutes late (or disappear on a connection rotation).
+    """
+    session = FakeSession(
+        [message(translation=types.Transcription(text="現在就顯示", finished=None))]
+    )
+    client = FakeClient([session])
+    release_pcm = asyncio.Event()
+
+    async def open_pcm():
+        yield b"a" * 3_200
+        await release_pcm.wait()
+
+    stream = stream_transcripts(open_pcm(), client=client, reconnect_delay_s=0)
+    try:
+        event = await asyncio.wait_for(anext(stream), timeout=0.5)
+        assert event == ("translation", "現在就顯示")
+    finally:
+        release_pcm.set()
+        await stream.aclose()
+
+
+async def test_repeated_fragments_in_one_connection_are_preserved() -> None:
+    """Consecutive equal deltas can be real speech, not reconnect replays."""
+    session = FakeSession(
+        [
+            message(translation=types.Transcription(text="好", finished=None)),
+            message(translation=types.Transcription(text="好", finished=None)),
+        ]
+    )
+    client = FakeClient([session])
+
+    got = await _collect(stream_transcripts(chunks(1), client=client, reconnect_delay_s=0))
+
+    assert [event for event in got if event == ("translation", "好")] == [
+        ("translation", "好"),
+        ("translation", "好"),
+    ]
+
+
+async def test_fragment_whitespace_is_preserved() -> None:
+    """Joining streamed deltas must not collapse spaces in code-switched speech."""
+    session = FakeSession(
+        [
+            message(translation=types.Transcription(text="Hello", finished=None)),
+            message(translation=types.Transcription(text=" ", finished=None)),
+            message(translation=types.Transcription(text="world", finished=None)),
+        ]
+    )
+    client = FakeClient([session])
+
+    got = await _collect(stream_transcripts(chunks(1), client=client, reconnect_delay_s=0))
+
+    assert ("translation", "Hello") in got
+    assert ("translation", " ") in got
+    assert ("translation", "world") in got
+
+
 async def test_reconnect_no_deadlock_empty_queue() -> None:
     """F1: a GoAway on connection 1 while the sender is parked on an EMPTY queue must
     reconnect, not hang. The whole call is bounded by wait_for; a deadlock would raise
@@ -185,8 +233,8 @@ async def test_reconnect_no_deadlock_empty_queue() -> None:
     assert client.aio.live.handles == [None, "h1"]
 
 
-async def test_dedup_finished_across_resume() -> None:
-    """F3: resumption replays the same finished line; it must be emitted only once."""
+async def test_resume_preserves_every_reported_fragment() -> None:
+    """The client must process every transcription event, including equal deltas."""
     first = FakeSession(
         [
             message(translation=types.Transcription(text="重複", finished=True), handle="h1"),
@@ -204,13 +252,15 @@ async def test_dedup_finished_across_resume() -> None:
         event
         async for event in stream_transcripts(chunks(1), client=client, reconnect_delay_s=0)
     ]
-    assert [e for e in got if e == ("translation", "重複")] == [("translation", "重複")]
+    assert [e for e in got if e == ("translation", "重複")] == [
+        ("translation", "重複"),
+        ("translation", "重複"),
+    ]
     assert ("translation", "新句") in got
 
 
-async def test_partial_cleared_on_reconnect() -> None:
-    """F2: a partial fragment from connection 1 must not concatenate onto a replayed
-    fragment after resume."""
+async def test_partial_fragment_is_not_dropped_on_reconnect() -> None:
+    """A received delta remains deliverable even if the connection then rotates."""
     first = FakeSession(
         [
             message(translation=types.Transcription(text="前半", finished=False), handle="h1"),
@@ -226,7 +276,7 @@ async def test_partial_cleared_on_reconnect() -> None:
         async for event in stream_transcripts(chunks(1), client=client, reconnect_delay_s=0)
     ]
     assert got.count(("translation", "完整句")) == 1
-    assert all("前半" not in text for _, text in got)
+    assert ("translation", "前半") in got
 
 
 async def test_disconnect_exception_reconnects() -> None:
@@ -317,16 +367,29 @@ async def test_queue_stays_bounded() -> None:
     assert [queue.get_nowait(), queue.get_nowait()] == [b"b", b"c"]
 
 
+async def test_fast_decoder_is_paced_to_realtime() -> None:
+    """Three 100 ms chunks from a fast decoder must span about 300 ms."""
+    queue = asyncio.Queue(maxsize=10)
+    started = time.monotonic()
+
+    await _pump_audio(chunks(3), queue)
+
+    assert time.monotonic() - started >= 0.25
+
+
 async def main() -> None:
     test_config()
-    test_transcript_buffer()
     await test_stream_and_resume()
+    await test_transcript_without_finished_flag_emits_while_stream_is_open()
+    await test_repeated_fragments_in_one_connection_are_preserved()
+    await test_fragment_whitespace_is_preserved()
     await test_reconnect_no_deadlock_empty_queue()
-    await test_dedup_finished_across_resume()
-    await test_partial_cleared_on_reconnect()
+    await test_resume_preserves_every_reported_fragment()
+    await test_partial_fragment_is_not_dropped_on_reconnect()
     await test_disconnect_exception_reconnects()
     await test_eof_send_failure_terminates()
     await test_queue_stays_bounded()
+    await test_fast_decoder_is_paced_to_realtime()
     print("all live translation tests passed")
 
 
