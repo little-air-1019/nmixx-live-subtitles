@@ -1,5 +1,14 @@
 # Gemini Live Translation Implementation Plan
 
+> **2026-09-03 correction:** This plan has been implemented, but its transcript-buffering
+> design is superseded. Google's current reference client forwards every non-empty
+> `input_transcription`/`output_transcription` chunk and does not wait for the optional
+> `finished` field. The production code now preserves every chunk (including whitespace and
+> repetitions), paces decoded audio at 1x real time, and lets Discord join fragments until
+> sentence punctuation with a one-second fallback. Do not reintroduce Task 2's
+> `_TranscriptBuffer` or the speculative global deduplication shown later in this historical
+> plan; the current source and regression tests are authoritative.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the lagging local Whisper plus batched text-translation pipeline with one resilient Gemini Live Translate stream that produces bounded-latency Traditional Chinese subtitles for a two-hour YouTube live.

@@ -26,8 +26,8 @@ flowchart TB
 
             subgraph PIPE["Pipeline: run_live_job(video_id)"]
                 CAP["capture.py<br/>yt-dlp + ffmpeg<br/>→ 16kHz mono s16le PCM, 100ms/3200 bytes chunks"]
-                LIVE["live_translate.py<br/>Gemini Live Translate WebSocket<br/>10 秒上限音訊佇列(塞爆丟最舊、記錄丟棄秒數)<br/>context-window compression + session resumption<br/>斷線/GoAway 用 resumption handle 重連<br/>→ output_audio_transcription(zh-Hant)"]
-                POST["discord.py DiscordPoster<br/>緩衝 1 秒後送出"]
+                LIVE["live_translate.py<br/>Gemini Live Translate WebSocket<br/>音訊以 1x real time 節奏送出<br/>10 秒上限音訊佇列(塞爆丟最舊、記錄丟棄秒數)<br/>context-window compression + session resumption<br/>斷線/GoAway 用 resumption handle 重連<br/>→ output_audio_transcription(zh-Hant) 即時片段"]
+                POST["discord.py DiscordPoster<br/>串接片段，句尾標點立即送出<br/>無標點時最遲緩衝 1 秒"]
             end
 
             ST[("state.json<br/>video_id → status/attempt")]
@@ -62,10 +62,10 @@ YouTube 有新影片/開播就 push 到 `POST /youtube/websub`（經 ngrok 進�
 ## Pipeline（run_live_job，直播期間持續執行）
 
 ```
-yt-dlp + ffmpeg → 100ms PCM chunks(16kHz mono s16le)
+yt-dlp + ffmpeg → 100ms PCM chunks(16kHz mono s16le，以 1x real time 節奏送出)
 → Gemini Live Translate WebSocket(zh-Hant, response_modalities=["AUDIO"])
-→ output_audio_transcription(已完成的翻譯句)
-→ DiscordPoster 緩衝(1s) → webhook
+→ output_audio_transcription(增量翻譯片段)
+→ DiscordPoster 串接片段(句尾標點立即送，無標點時 1s fallback) → webhook
 ```
 
 只有一個階段：音訊進、zh-Hant 文字出，沒有本機 ASR，也沒有另外一次文字翻譯 call。
@@ -76,12 +76,19 @@ model 由 `GEMINI_LIVE_MODEL` env 控制（預設 `gemini-3.5-live-translate-pre
 成本設計：Google 依音訊時長計費（非實際講話時間），約 $0.0368/分鐘，兩小時直播單一目標語言
 約 **$4.42 USD**。
 
+`output_audio_transcription` 是增量片段；API 的 optional `finished` 欄位不能當成可靠的
+delivery boundary。因此每個非空片段都立即往下游傳，保留原本的空白與重複字詞，再由
+`DiscordPoster` 串接到句尾標點；若沒有標點則以一秒上限送出，避免無限等待或任意插入換行。
+
 韌性（`live_translate.py`）：音訊佇列上限 **10 秒**，API 卡住時丟棄最舊的音訊而非無限堆積
 （保住即時性），並記錄實際丟棄的秒數；靠 **context-window compression** 與
 **session resumption** 撐過 Google WebSocket 每 ~10 分鐘的輪替、以及未壓縮音訊 session 的
-15 分鐘上限；遇到 GoAway 或斷線就用先前存下的 resumption handle 重連；重連時會清掉未完成的
-片段、並對重播的已完成句子去重，避免字幕被截斷合併或重複貼出。API/socket/語言/佇列丟棄等
-錯誤一律記錄下來，絕不會靜默 fallback 回韓文原文。
+15 分鐘上限；遇到 GoAway 或斷線就用先前存下的 resumption handle 重連。API/socket/語言/
+佇列丟棄等錯誤一律記錄下來，絕不會靜默 fallback 回韓文原文。
+
+模型本身仍有品質上限：Google 文件列出背景音樂/噪音、多人重疊、重口音、相似語言與快速
+切換語言等限制；Live Translate 也不接受自訂 prompt 或 glossary。這些場景若過不了
+`glossary.md` 的人工 gate，需改用 `docs/model-research.md` 的兩階段 fallback，而不是再調整片段計時。
 
 ## 狀態與韌性
 

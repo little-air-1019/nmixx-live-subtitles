@@ -4,7 +4,7 @@ Watches a YouTube channel for live streams, translates the Korean speech to Trad
 Chinese (zh-TW), and posts subtitle lines to a Discord webhook in near real time.
 
 Pipeline: YouTube WebSub push -> live/upcoming/ended classification -> ffmpeg 16 kHz mono
-PCM in 100 ms chunks -> Gemini Live Translate (zh-Hant) -> Discord.
+PCM in 100 ms chunks paced at real time -> Gemini Live Translate (zh-Hant) -> Discord.
 
 Translation runs as a single Gemini Live Translate WebSocket stream (`GEMINI_LIVE_MODEL`,
 default `gemini-3.5-live-translate-preview`) -- audio goes in, translated Traditional
@@ -52,6 +52,11 @@ a backstop in case a WebSub push is missed).
 When a video goes live, the service captures audio, streams it to Gemini Live Translate, and
 posts the translated lines to Discord -- one live stream at a time. Upcoming (scheduled) streams are polled
 every 60s starting ~2 minutes before their scheduled start, giving up after a 2-hour window.
+
+Gemini returns incremental transcription fragments. The service forwards every non-empty
+fragment immediately (the API's optional `finished` flag is not a delivery boundary), preserves
+spaces and repeated words, and joins fragments until sentence punctuation. A one-second fallback
+keeps unpunctuated speech bounded instead of waiting indefinitely.
 
 ## Running as a launchd service (survives reboots)
 
@@ -121,3 +126,8 @@ currently-live video or a local audio file.
 `glossary.md` is now a manual human quality checklist (member names, slang, lore terms) for
 reviewers to check subtitles against -- the Live Translate model doesn't accept a custom
 prompt or glossary, so nothing from it is injected at translation time.
+
+Google documents reduced accuracy around background music/noise, overlapping speakers, heavy
+accents, similar languages, and rapid language switching. If those cases still miss the glossary
+quality gate, use the two-stage fallback in `docs/model-research.md`; client-side chunking cannot
+correct a model translation after it has been emitted.
