@@ -8,6 +8,8 @@ dependencies = [
     "uvicorn>=0.30",
     "httpx>=0.27",
     "google-genai>=2.22",
+    "websockets>=15,<17",
+    "opencc-python-reimplemented>=0.1.7,<0.2",
 ]
 
 [tool.uv]

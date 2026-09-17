@@ -11,7 +11,7 @@ from nmixx_subtitles import main
 class FakePoster:
     instances = []
 
-    def __init__(self):
+    def __init__(self, *, transform=None):
         self.sent = []
         self.closed = False
         self.__class__.instances.append(self)

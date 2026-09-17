@@ -1,15 +1,16 @@
-"""Glue: WebSub trigger -> capture -> Gemini Live Translate -> Discord."""
+"""Glue: WebSub trigger -> capture -> selected subtitle provider -> Discord."""
 import asyncio
 import json
 import logging
 import time
+from contextlib import aclosing
 
 from fastapi import FastAPI
 
 from nmixx_subtitles import config
 from nmixx_subtitles.capture import pcm_stream
 from nmixx_subtitles.discord import DiscordPoster
-from nmixx_subtitles.live_translate import stream_transcripts
+from nmixx_subtitles.subtitles import stream_transcripts, subtitle_transform
 from nmixx_subtitles.trigger import make_router
 from nmixx_subtitles.youtube import channel_live_video_id, video_state, websub_subscribe
 
@@ -63,21 +64,27 @@ async def run_live_job(video_id: str) -> None:
     """
     global _current_job, _current_video_id
     attempt = _state.get(video_id, {}).get("attempt", 0) + 1
-    log.info("live job starting for video_id=%s (attempt %d)", video_id, attempt)
-    poster = DiscordPoster()
+    log.info("live job starting for video_id=%s (attempt %d, provider=%s)",
+             video_id, attempt, config.SUBTITLE_PROVIDER)
+    poster = None
     first_line = True
     segment_count = 0
     try:
-        async for kind, text in stream_transcripts(pcm_stream(video_id)):
-            if kind == "source":
-                log.info("source transcript video_id=%s: %s", video_id, text)
-                continue
-            log.info("translation video_id=%s: %s", video_id, text)
-            if first_line:
-                text = f"https://www.youtube.com/watch?v={video_id}\n{text}"
-                first_line = False
-            await poster.send(text)
-            segment_count += 1
+        poster = DiscordPoster(transform=subtitle_transform())
+        async with aclosing(pcm_stream(video_id)) as audio:
+            async with aclosing(stream_transcripts(audio)) as events:
+                async for kind, text in events:
+                    if kind == "source":
+                        log.info("source transcript video_id=%s: %s", video_id, text)
+                        continue
+                    log.info("subtitle video_id=%s: %s", video_id, text)
+                    if first_line:
+                        text = f"https://www.youtube.com/watch?v={video_id}\n{text}"
+                        first_line = False
+                    await poster.send(text)
+                    segment_count += 1
+        await poster.close()
+        poster = None
         log.info("live job for video_id=%s ended: stream finished (%d segments)", video_id, segment_count)
         _mark(video_id, "completed")
     except Exception:
@@ -88,9 +95,12 @@ async def run_live_job(video_id: str) -> None:
         else:
             _mark(video_id, "error", attempt=attempt)
     finally:
-        await poster.close()
-        _current_job = None
-        _current_video_id = None
+        try:
+            if poster is not None:
+                await poster.close()
+        finally:
+            _current_job = None
+            _current_video_id = None
 
 
 async def start_live_job(video_id: str) -> None:

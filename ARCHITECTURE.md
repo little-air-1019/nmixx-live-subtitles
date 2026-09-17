@@ -9,6 +9,7 @@ flowchart TB
         YT["YouTube<br/>(NMIXX channel)"]
         HUB["WebSub Hub<br/>(pubsubhubbub)"]
         GEMINI["Gemini Live Translate<br/>(GEMINI_LIVE_MODEL,<br/>預設 gemini-3.5-live-translate-preview)"]
+        SONIOX["Soniox Speech-to-Text<br/>stt-rt-v5 + translation"]
         DC["Discord Webhook"]
     end
 
@@ -26,7 +27,7 @@ flowchart TB
 
             subgraph PIPE["Pipeline: run_live_job(video_id)"]
                 CAP["capture.py<br/>yt-dlp + ffmpeg<br/>→ 16kHz mono s16le PCM, 100ms/3200 bytes chunks"]
-                LIVE["live_translate.py<br/>Gemini Live Translate WebSocket<br/>音訊以 1x real time 節奏送出<br/>10 秒上限音訊佇列(塞爆丟最舊、記錄丟棄秒數)<br/>context-window compression + session resumption<br/>斷線/GoAway 用 resumption handle 重連<br/>→ output_audio_transcription(zh-Hant) 即時片段"]
+                LIVE["subtitles.py<br/>依 SUBTITLE_PROVIDER 選擇 Gemini 或 Soniox<br/>音訊以 1x real time 節奏送出<br/>10 秒上限音訊佇列(塞爆丟最舊、記錄丟棄秒數)<br/>→ source / subtitle 文字事件"]
                 POST["discord.py DiscordPoster<br/>串接片段，句尾標點立即送出<br/>無標點時最遲緩衝 1 秒"]
             end
 
@@ -44,6 +45,7 @@ flowchart TB
     OV <--> ST
     YT -- "HLS 音訊" --> CAP --> LIVE --> POST --> DC
     LIVE <--> GEMINI
+    LIVE <--> SONIOX
     RESUB --> HUB
 ```
 
@@ -63,12 +65,39 @@ YouTube 有新影片/開播就 push 到 `POST /youtube/websub`（經 ngrok 進�
 
 ```
 yt-dlp + ffmpeg → 100ms PCM chunks(16kHz mono s16le，以 1x real time 節奏送出)
-→ Gemini Live Translate WebSocket(zh-Hant, response_modalities=["AUDIO"])
-→ output_audio_transcription(增量翻譯片段)
+→ subtitles.py 選擇單一供應商（預設 gemini）
+  Gemini: live_translate.py → output_audio_transcription(zh-Hant 增量翻譯片段)
+  Soniox: soniox_translate.py → final tokens（中文譯文／英文原文）→ OpenCC 繁體轉換
 → DiscordPoster 串接片段(句尾標點立即送，無標點時 1s fallback) → webhook
 ```
 
-只有一個階段：音訊進、zh-Hant 文字出，沒有本機 ASR，也沒有另外一次文字翻譯 call。
+兩個供應商都沒有本機 ASR，也沒有另外一次文字翻譯 call。每場只使用一個供應商，
+不會遇錯誤就自動切換到另一個付費服務；改 `.env` 後需重新啟動。
+
+### Soniox
+
+`SONIOX_MODEL` 預設 `stt-rt-v5`，同一條 WebSocket 回傳原文與翻譯文字，不產生翻譯語音。
+預設 `SONIOX_TRANSLATE_ENGLISH=false` 使用官方支援的 `two_way` 韓中配對：韓文翻中文，
+英文及配對以外語言只轉錄並原樣顯示。中文原文也會顯示；API 產生的反向韓文譯文不送到
+Discord，但仍可能計入費用。設為 `true` 改用 `one_way`，所有支援語言翻成中文。
+語言辨識由 Soniox 處理，本機只依 token metadata 分流，無額外辨識模型或 API call。
+
+只接收 `is_final=true` 的文字，忽略可覆寫的暫定 token 及 `<end>`／`<fin>` 控制標記，
+避免 Discord 出現重複的猜測文字。保留真正重複的字詞及空白，不用字串去重。
+`DiscordPoster` 串接片段後使用 OpenCC `s2twp` 轉成臺灣繁體字詞；這不等於語意校正。
+`glossary.md` 的簡單對照表轉成 `context.translation_terms`，作為人名及術語提示。
+
+音訊佇列上限 10 秒、塞滿丟最舊；等待音訊時每 10 秒 keepalive，連線 295 分鐘時送出
+空 frame 並等待 `finished`，再開新連線，避免超過官方 300 分鐘限制。暫時性錯誤最多
+連續重試 5 次並遞增等待；金鑰、餘額及設定錯誤直接交回 job 的錯誤處理。
+真正 EOF 後只收尾、不重連，10 秒未收到 `finished` 或收到 API 錯誤都視為失敗。
+此 adapter 沒有 Soniox session resumption：突然斷線時已送出但尚未定稿的內容可能遺失。
+
+`preview.py` 使用相同分流、轉換及合併邏輯，限定輸入音訊秒數並只輸出到終端機，
+不使用 Discord webhook 或修改 job state。這仍會呼叫付費 API。
+
+### Gemini
+
 model 由 `GEMINI_LIVE_MODEL` env 控制（預設 `gemini-3.5-live-translate-preview`，屬 Preview
 模型）。雖然只取文字稿，但這顆模型要求 `response_modalities=["AUDIO"]` 才會產生
 `output_audio_transcription`。
@@ -103,6 +132,8 @@ delivery boundary。因此每個非空片段都立即往下游傳，保留原本
 ## 設定
 
 `.env`：`DISCORD_WEBHOOK_URL`、`GEMINI_API_KEY`、`GEMINI_LIVE_MODEL`、`YOUTUBE_API_KEY`、
-`PUBLIC_BASE_URL`（ngrok 網址）、`WEBSUB_VERIFY_TOKEN`、`YOUTUBE_CHANNEL_ID`。
-`glossary.md` 現在是人工品質檢查清單（成員名/slang/世界觀術語），供人工複核字幕用——
-Live Translate 模型不接受自訂 prompt 或 glossary，所以內容不會被注入翻譯過程。
+`PUBLIC_BASE_URL`（ngrok 網址）、`WEBSUB_VERIFY_TOKEN`、`YOUTUBE_CHANNEL_ID`、
+`SUBTITLE_PROVIDER`（`gemini`／`soniox`）、`SONIOX_API_KEY`、`SONIOX_MODEL`、
+`SONIOX_TRANSLATE_ENGLISH`。`SONIOX_WEBSOCKET_URL` 可覆寫端點，預設官方美國端點；
+其他區域需先確認帳戶權限。設定範例與試跑方式見 README。
+`glossary.md` 同時供人工複核與 Soniox context 使用；Gemini 不接受 glossary。

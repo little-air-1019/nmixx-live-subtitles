@@ -27,4 +27,13 @@ GEMINI_LIVE_MODEL = os.environ.get(
     "GEMINI_LIVE_MODEL",
     "gemini-3.5-live-translate-preview",
 )
+SUBTITLE_PROVIDER = os.environ.get("SUBTITLE_PROVIDER", "gemini").strip().lower()
+SONIOX_API_KEY = os.environ.get("SONIOX_API_KEY", "")
+SONIOX_MODEL = os.environ.get("SONIOX_MODEL", "stt-rt-v5")
+SONIOX_WEBSOCKET_URL = os.environ.get(
+    "SONIOX_WEBSOCKET_URL", "wss://stt-rt.soniox.com/transcribe-websocket"
+)
+SONIOX_TRANSLATE_ENGLISH = os.environ.get("SONIOX_TRANSLATE_ENGLISH", "false").lower() in (
+    "true", "1", "yes",
+)
 STATE_FILE = ROOT / "state.json"

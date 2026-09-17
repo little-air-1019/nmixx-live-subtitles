@@ -103,26 +103,39 @@ async def pcm_stream(
     stderr_task = asyncio.create_task(_drain_stderr(ffmpeg, "ffmpeg"))
 
     saw_any = False
+    reached_eof = False
     try:
         while True:
             chunk = await ffmpeg.stdout.readexactly(chunk_bytes)
             saw_any = True
             yield chunk
     except asyncio.IncompleteReadError as e:
+        reached_eof = True
         if e.partial:
             saw_any = True
             yield e.partial  # final short chunk at EOF
     finally:
-        if ffmpeg.returncode is None:
-            ffmpeg.terminate()
-            try:
-                await asyncio.wait_for(ffmpeg.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                ffmpeg.kill()
         stderr_task.cancel()
+        await asyncio.gather(stderr_task, return_exceptions=True)
+        if ffmpeg.returncode is None:
+            try:
+                ffmpeg.terminate()
+            except ProcessLookupError:
+                pass
+        # Drain both pipes even when the consumer stops early (e.g. API rejects the
+        # request). wait() alone can deadlock on a full stdout pipe and leave transports
+        # alive after the event loop closes. The stderr reader has relinquished its pipe.
+        try:
+            await asyncio.wait_for(ffmpeg.communicate(), timeout=5)
+        except asyncio.TimeoutError:
+            try:
+                ffmpeg.kill()
+            except ProcessLookupError:
+                pass
+            await ffmpeg.communicate()
         # ffmpeg exiting non-zero without ever producing audio means the pull failed
         # (expired manifest, geo-block, 403). Surface it instead of letting the caller
         # read "0 chunks" as a normal empty stream. A non-zero code after we already
         # got audio is just our own terminate() above -- not a failure.
-        if not saw_any and ffmpeg.returncode not in (None, 0):
+        if reached_eof and not saw_any and ffmpeg.returncode not in (None, 0):
             raise RuntimeError(f"capture ffmpeg exited {ffmpeg.returncode} for source={source!r}")

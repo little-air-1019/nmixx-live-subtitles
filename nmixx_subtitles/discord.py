@@ -2,6 +2,7 @@
 import asyncio
 import re
 import time
+from collections.abc import Callable
 
 import httpx
 
@@ -18,10 +19,14 @@ SENTENCE_END = re.compile(
 class DiscordPoster:
     """Buffers subtitle fragments and posts them to a Discord webhook."""
 
-    def __init__(self, webhook_url: str = DISCORD_WEBHOOK_URL):
+    def __init__(
+        self, webhook_url: str = DISCORD_WEBHOOK_URL, *,
+        transform: Callable[[str], str] | None = None,
+    ):
         if not webhook_url or not webhook_url.startswith(("http://", "https://")):
             raise ValueError(f"DiscordPoster needs a valid http(s) webhook URL, got: {webhook_url!r}")
         self.webhook_url = webhook_url
+        self._transform = transform
         self._buf: list[str] = []
         self._buf_chars = 0
         self._buf_started: float | None = None
@@ -94,6 +99,8 @@ class DiscordPoster:
         if not self._buf:
             return
         text = "".join(self._buf)
+        if self._transform is not None:
+            text = self._transform(text)
         chunks = _split_chunks(text, DISCORD_MAX_CHARS)
         for i, chunk in enumerate(chunks):
             try:
