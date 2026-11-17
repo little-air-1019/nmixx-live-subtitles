@@ -36,4 +36,11 @@ SONIOX_WEBSOCKET_URL = os.environ.get(
 SONIOX_TRANSLATE_ENGLISH = os.environ.get("SONIOX_TRANSLATE_ENGLISH", "false").lower() in (
     "true", "1", "yes",
 )
+TEXT_TRANSLATION_MODEL = os.environ.get("TEXT_TRANSLATION_MODEL", "gemini-3.5-flash-lite")
+QUALITY_CAPTURE_ENABLED = os.environ.get("QUALITY_CAPTURE_ENABLED", "true").lower() in ("true", "1", "yes")
+QUALITY_CAPTURE_DIR = Path(os.environ.get(
+    "QUALITY_CAPTURE_DIR", str(Path.home() / "Library/Application Support/nmixx-subtitles/sessions"),
+)).expanduser()
+QUALITY_RETENTION_DAYS = int(os.environ.get("QUALITY_RETENTION_DAYS", "7"))
+QUALITY_MAX_BYTES = int(os.environ.get("QUALITY_MAX_BYTES", str(2 * 1024**3)))
 STATE_FILE = ROOT / "state.json"

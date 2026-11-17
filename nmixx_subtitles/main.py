@@ -8,6 +8,7 @@ from contextlib import aclosing
 from fastapi import FastAPI
 
 from nmixx_subtitles import config
+from nmixx_subtitles.recording import quality_session, emit
 from nmixx_subtitles.capture import pcm_stream
 from nmixx_subtitles.discord import DiscordPoster
 from nmixx_subtitles.subtitles import stream_transcripts, subtitle_transform
@@ -55,6 +56,11 @@ def _mark(video_id: str, status: str, **extra) -> None:
 
 
 async def run_live_job(video_id: str) -> None:
+    async with quality_session("youtube", config.SUBTITLE_PROVIDER, video_id=video_id):
+        await _run_live_job(video_id)
+
+
+async def _run_live_job(video_id: str) -> None:
     """Capture -> ASR -> translate -> Discord for one live video. Runs until stream ends.
 
     A transient failure (network blip, Discord 5xx, capture hiccup) must not permanently
@@ -87,7 +93,8 @@ async def run_live_job(video_id: str) -> None:
         poster = None
         log.info("live job for video_id=%s ended: stream finished (%d segments)", video_id, segment_count)
         _mark(video_id, "completed")
-    except Exception:
+    except Exception as exc:
+        emit("pipeline_error", exception_type=type(exc).__name__)
         log.exception("live job for video_id=%s crashed after %d segments (attempt %d)", video_id, segment_count, attempt)
         if attempt >= MAX_JOB_ATTEMPTS:
             log.error("live job for video_id=%s failed permanently after %d attempts", video_id, attempt)

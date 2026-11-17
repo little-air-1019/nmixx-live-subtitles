@@ -9,6 +9,7 @@ import os
 import shutil
 from pathlib import Path
 from typing import AsyncGenerator
+from urllib.parse import urlsplit
 
 SAMPLE_RATE = 16000
 CHUNK_BYTES = SAMPLE_RATE * 2 // 10  # 100 ms of mono s16le
@@ -77,8 +78,14 @@ async def _spawn_stream_pipeline(source: str) -> asyncio.subprocess.Process:
         raise RuntimeError(f"yt-dlp failed to resolve manifest for {source!r}: {err.decode(errors='replace')[:300]}")
     manifest = out.decode().strip().splitlines()[0]
 
+    # HLS defaults to starting three segments from the end. YouTube currently
+    # uses five-second segments, so start at the latest available segment to
+    # avoid adding another ten seconds before ASR even sees the audio.
+    path = urlsplit(manifest).path
+    input_options = ["-live_start_index", "-1"] if ".m3u8" in path or "/manifest/hls_" in path else []
+
     return await asyncio.create_subprocess_exec(
-        FFMPEG, "-nostdin", "-i", manifest,
+        FFMPEG, "-nostdin", *input_options, "-i", manifest,
         "-f", "s16le", "-acodec", "pcm_s16le", "-ar", str(SAMPLE_RATE), "-ac", "1",
         "-loglevel", "error", "pipe:1",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,

@@ -7,6 +7,7 @@ from google import genai
 from google.genai import types
 
 from nmixx_subtitles import config
+from nmixx_subtitles import recording
 
 log = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ async def _put_latest(
     on_drop,
 ) -> None:
     if queue.full():
-        queue.get_nowait()
+        recording.audio_dropped(queue.get_nowait())
         on_drop(1)
     queue.put_nowait(item)
 
@@ -97,6 +98,7 @@ async def _send_audio(
     """
     # ponytail: 100 ms poll instead of an event-woken get; drop-oldest already tolerates
     # <=100 ms extra queue latency, and this is the only race-free option for asyncio.Queue.
+    sent_samples = 0
     while not reconnect.is_set():
         try:
             chunk = await asyncio.wait_for(queue.get(), timeout=SEND_POLL_S)
@@ -110,9 +112,12 @@ async def _send_audio(
             input_done.set()
             await session.send_realtime_input(audio_stream_end=True)
             return
+        recording.audio_send_started(chunk, sent_samples)
         await session.send_realtime_input(
             audio=types.Blob(data=chunk, mime_type=AUDIO_MIME)
         )
+        recording.audio_sent(chunk, sent_samples)
+        sent_samples += len(chunk) // 2
 
 
 async def _emit(
@@ -123,6 +128,7 @@ async def _emit(
     # Transcriptions are streamed deltas. Preserve their whitespace and order; Google
     # does not guarantee that the optional ``finished`` field will be populated.
     if text:
+        recording.emit("gemini_transcript", text_kind=kind, text=text)
         await events.put((kind, text))
 
 
@@ -182,6 +188,7 @@ async def _run_connections(
                 model=config.GEMINI_LIVE_MODEL,
                 config=build_live_config(state["handle"]),
             ) as session:
+                recording.connection_started("gemini", resumed=bool(state["handle"]))
                 failures = 0
                 sender = asyncio.create_task(
                     _send_audio(session, audio, reconnect, input_done)
@@ -206,7 +213,8 @@ async def _run_connections(
                 for task in done:
                     task.result()  # re-raise; caught below to reconnect with saved handle
                 reconnect.set()
-        except Exception:
+        except Exception as exc:
+            recording.emit("connection_error", exception_type=type(exc).__name__)
             if input_done.is_set():
                 return  # EOF already delivered; a late socket error is not a reconnect reason
             failures += 1

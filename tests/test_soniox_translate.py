@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from nmixx_subtitles import soniox_translate as st
 from nmixx_subtitles import subtitles
+from nmixx_subtitles import text_translate
 from nmixx_subtitles.discord import DiscordPoster
 from nmixx_subtitles.preview import limited_pcm
 
@@ -79,7 +80,7 @@ async def paused_audio():
 async def collect(pcm, connector):
     async with asyncio.timeout(2):
         return [event async for event in st.stream_transcripts(
-            pcm, connector=connector, translate_english=False, reconnect_delay_s=0,
+            pcm, connector=connector, translate_english=True, reconnect_delay_s=0,
         )]
 
 
@@ -191,7 +192,7 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         events = asyncio.Queue()
         state = st._InputState()
         with patch.object(st, "ROTATE_AFTER_S", 0.01):
-            await asyncio.wait_for(st._session(ws, asyncio.Queue(), events, state, False), 1)
+            await asyncio.wait_for(st._session(ws, asyncio.Queue(), events, state, True), 1)
         self.assertFalse(state.ended)
         self.assertEqual(events.get_nowait(), ("subtitle", "轮替。"))
         self.assertEqual(ws.sent, [""])
@@ -269,7 +270,7 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
             yield b"\x00\x00"
 
         ws = Socket(final=[{"tokens": [
-            token("소프트웨어 좋아요", "ko", "original"),
+            token("소프트웨어 좋아요.", "ko", "original"),
             token("软件真好。"),
             token("Hello everyone.", "en", "none"),
         ]}])
@@ -279,6 +280,7 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
             patch.object(subtitles.config, "SONIOX_API_KEY", "test"),
             patch.object(subtitles.config, "SONIOX_TRANSLATE_ENGLISH", False),
             patch.object(st, "connect", Connector(ws)),
+            patch.object(text_translate, "TextTranslator") as translator_factory,
             patch.object(main, "pcm_stream", fake_capture),
             patch.object(main, "DiscordPoster", Poster),
             patch.object(main, "_mark", lambda *args, **kwargs: marks.append(args)),
@@ -288,6 +290,7 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
             "https://www.youtube.com/watch?v=abcdefghijk\n軟體真好。", "Hello everyone.",
         ])
         self.assertEqual(marks, [("abcdefghijk", "completed")])
+        translator_factory.assert_not_called()
 
 
 if __name__ == "__main__":

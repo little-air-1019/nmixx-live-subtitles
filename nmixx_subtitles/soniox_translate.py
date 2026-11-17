@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from websockets.asyncio.client import connect
 
 from nmixx_subtitles import config
+from nmixx_subtitles import recording
+from nmixx_subtitles.text_translate import TranscriptRouter
 
 log = logging.getLogger(__name__)
 # WebSocket DEBUG logging includes the first frame, which contains the API key.
@@ -45,7 +47,7 @@ def build_context() -> dict:
 
 
 def build_live_config(*, translate_english: bool, reference_id: str) -> dict:
-    return {
+    result = {
         "api_key": config.SONIOX_API_KEY,
         "model": config.SONIOX_MODEL,
         "audio_format": "pcm_s16le",
@@ -57,13 +59,14 @@ def build_live_config(*, translate_english: bool, reference_id: str) -> dict:
         "max_endpoint_delay_ms": 1000,
         "client_reference_id": reference_id,
         "context": build_context(),
-        # Languages outside a two-way pair are transcribed without translation.
-        # Chinese -> Korean output is discarded by final_events below.
-        "translation": (
-            {"type": "one_way", "target_language": "zh"} if translate_english else
-            {"type": "two_way", "language_a": "ko", "language_b": "zh"}
-        ),
     }
+    if translate_english:
+        result["translation"] = {"type": "one_way", "target_language": "zh"}
+    else:
+        # Native Korean translation avoids a second request on the common path.
+        # English passes through; only languages outside ko/en/zh use text fallback.
+        result["translation"] = {"type": "two_way", "language_a": "ko", "language_b": "zh"}
+    return result
 
 
 def final_events(response: dict, *, translate_english: bool) -> list[tuple[str, str]]:
@@ -114,7 +117,9 @@ async def _pump_audio(pcm: AsyncIterable[bytes], audio: asyncio.Queue) -> None:
         if not chunk:  # an empty frame is a protocol end-of-stream, not audio
             continue
         if audio.full():
-            dropped += len(audio.get_nowait()) / PCM_BYTES_PER_SECOND
+            discarded = audio.get_nowait()
+            recording.audio_dropped(discarded)
+            dropped += len(discarded) / PCM_BYTES_PER_SECOND
             log.warning("Soniox audio queue full; dropped %.1fs total to stay near live", dropped)
         audio.put_nowait(chunk)
         seconds += len(chunk) / PCM_BYTES_PER_SECOND
@@ -131,6 +136,7 @@ class _InputState:
 async def _send_audio(ws, audio: asyncio.Queue, state: _InputState, ending: asyncio.Event) -> None:
     loop = asyncio.get_running_loop()
     started = last_sent = loop.time()
+    sent_samples = 0
     while True:
         if loop.time() - started >= ROTATE_AFTER_S:
             ending.set()
@@ -151,20 +157,32 @@ async def _send_audio(ws, audio: asyncio.Queue, state: _InputState, ending: asyn
                 await ws.send("")
                 return
             state.pending = chunk
+        recording.audio_send_started(state.pending, sent_samples)
         await ws.send(state.pending)
+        recording.audio_sent(state.pending, sent_samples)
+        sent_samples += len(state.pending) // 2
         state.pending = None
         last_sent = loop.time()
 
 
 async def _receive(ws, events: asyncio.Queue, translate_english: bool) -> None:
-    async for raw in ws:
-        response = json.loads(raw)
-        if response.get("error_code") is not None:
-            raise SonioxAPIError(response)
-        for event in final_events(response, translate_english=translate_english):
-            await events.put(event)
-        if response.get("finished"):
-            return
+    router = None if translate_english else TranscriptRouter()
+    try:
+        async for raw in ws:
+            response = json.loads(raw)
+            recording.soniox_response(response)
+            if response.get("error_code") is not None:
+                raise SonioxAPIError(response)
+            routed = (router.feed(response) if router is not None else
+                      final_events(response, translate_english=True))
+            for event in routed:
+                await events.put(event)
+            if response.get("finished"):
+                return
+    finally:
+        if router is not None and not asyncio.current_task().cancelling():
+            for event in router.flush():
+                await events.put(event)
     raise ConnectionError("Soniox connection closed before finished response")
 
 
@@ -198,9 +216,10 @@ async def _run_connections(audio, events, connector, translate_english, reconnec
                 config.SONIOX_WEBSOCKET_URL, open_timeout=10, close_timeout=5,
                 max_size=4 * 1024 * 1024, logger=wire_log,
             ) as ws:
-                await ws.send(json.dumps(build_live_config(
-                    translate_english=translate_english, reference_id=reference,
-                )))
+                recording.connection_started("soniox")
+                live_config = build_live_config(translate_english=translate_english, reference_id=reference)
+                recording.soniox_config(live_config)
+                await ws.send(json.dumps(live_config))
                 log.info("Soniox connected: model=%s reference=%s", config.SONIOX_MODEL, reference)
                 await _session(ws, audio, events, state, translate_english)
             if state.ended:
@@ -208,6 +227,7 @@ async def _run_connections(audio, events, connector, translate_english, reconnec
             failures = 0  # graceful planned rotation
             log.info("Soniox rotating connection before session duration limit")
         except Exception as exc:
+            recording.emit("connection_error", exception_type=type(exc).__name__)
             if state.ended or isinstance(exc, SonioxAPIError) and not exc.retryable:
                 raise
             # A handshake alone doesn't reset retries (e.g. persistent 503 responses).
@@ -234,6 +254,7 @@ async def stream_transcripts(
     worker = asyncio.create_task(_run_connections(
         audio, events, connector or connect, translate_english, reconnect_delay_s,
     ))
+    last_queue_warning = 0.0
     try:
         while True:
             if producer.done() and not producer.cancelled() and producer.exception() is not None:
@@ -242,7 +263,12 @@ async def stream_transcripts(
                 await worker
                 return
             try:
-                yield await asyncio.wait_for(events.get(), timeout=0.1)
+                event = await asyncio.wait_for(events.get(), timeout=0.1)
+                now = asyncio.get_running_loop().time()
+                if events.qsize() >= 100 and now - last_queue_warning >= 10:
+                    log.warning("Soniox subtitle delivery backlog: %d events", events.qsize())
+                    last_queue_warning = now
+                yield event
             except asyncio.TimeoutError:
                 pass
     finally:

@@ -7,6 +7,7 @@ from collections.abc import Callable
 import httpx
 
 from nmixx_subtitles.config import DISCORD_WEBHOOK_URL
+from nmixx_subtitles import recording
 
 FLUSH_AGE_S = 1.0
 FLUSH_CHARS = 500
@@ -33,6 +34,8 @@ class DiscordPoster:
         self._lock = asyncio.Lock()
         self._client = httpx.AsyncClient(timeout=10.0)
         self._closed = False
+        self._post_sequence = 0
+        self._record_destination = "discord"
         self._stop = asyncio.Event()
         # ponytail: watcher task is created lazily on first send() (line ~34), not here,
         # so constructing a DiscordPoster outside a running event loop doesn't raise.
@@ -99,13 +102,21 @@ class DiscordPoster:
         if not self._buf:
             return
         text = "".join(self._buf)
+        before_transform = text
         if self._transform is not None:
             text = self._transform(text)
+        recording.emit("subtitle_transform", before=before_transform, after=text)
         chunks = _split_chunks(text, DISCORD_MAX_CHARS)
         for i, chunk in enumerate(chunks):
             try:
+                self._post_sequence += 1
+                recording.emit("post_attempt", post_id=self._post_sequence, text=chunk,
+                               destination=self._record_destination)
                 await self._post(chunk)
+                recording.emit("post_complete", post_id=self._post_sequence, text=chunk,
+                               destination=self._record_destination)
             except Exception:
+                recording.emit("post_failed", post_id=self._post_sequence)
                 # Requeue this chunk and everything after it; already-sent chunks stay gone.
                 remainder = "".join(chunks[i:])
                 self._buf = [remainder] if remainder else []
@@ -120,6 +131,7 @@ class DiscordPoster:
         while True:
             resp = await self._client.post(self.webhook_url, json={"content": content})
             if resp.status_code == 429:
+                recording.emit("discord_rate_limit", post_id=self._post_sequence)
                 retry_after = 1.0
                 try:
                     retry_after = float(resp.json().get("retry_after") or 1.0)
@@ -128,6 +140,7 @@ class DiscordPoster:
                 await asyncio.sleep(retry_after)
                 continue
             resp.raise_for_status()
+            recording.emit("discord_accepted", post_id=self._post_sequence, text=content)
             remaining = resp.headers.get("X-RateLimit-Remaining")
             reset_after = resp.headers.get("X-RateLimit-Reset-After")
             if remaining is not None and reset_after is not None and float(remaining) <= 0:

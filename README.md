@@ -12,10 +12,11 @@ Chinese text comes out, with no separate ASR or text-translation step. Note this
 **Preview** model; a two-hour live stream costs roughly **$4.42 USD** (~$0.0368/audio
 minute, billed by stream duration, not speaking time).
 
-Soniox is also available: `stt-rt-v5` returns transcription and translation text over one
-WebSocket, without generating translated speech. It can keep English as English subtitles
-while translating Korean into Chinese; OpenCC converts Chinese output to Traditional Chinese
-with Taiwan phrase mappings. See the trial instructions below.
+Soniox is also available: by default `stt-rt-v5` transcribes and translates Korean into
+Chinese in one stream. English goes directly to subtitles, and only other languages use
+the Gemini text API (`gemini-3.5-flash-lite`). Spoken Chinese is normalized locally. No translated speech is
+generated. OpenCC converts Chinese output to Traditional Chinese with Taiwan phrase mappings.
+See the trial instructions below.
 
 Full architecture design and diagram: [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -47,6 +48,7 @@ your existing `.env` (unquoted values). Keep the actual key local:
 SONIOX_API_KEY=your-key-here
 SONIOX_MODEL=stt-rt-v5
 SONIOX_TRANSLATE_ENGLISH=false
+TEXT_TRANSLATION_MODEL=gemini-3.5-flash-lite
 ```
 
 The App's weekly free credits do not supply the API balance. Soniox
@@ -80,12 +82,30 @@ For a manually started service, stop and restart the existing `uvicorn` process.
 is read at process startup. Roll back by setting `SUBTITLE_PROVIDER=gemini` and restarting;
 retain `GEMINI_API_KEY` for this. The service does not automatically switch paid providers on errors.
 
-With `SONIOX_TRANSLATE_ENGLISH=false`, the API uses the documented Korean/Chinese `two_way`
-pair. Korean is translated, English and other languages outside that pair are transcribed only.
-Spoken Chinese is displayed as Chinese; its reverse Korean translation is suppressed locally,
-but can still incur API output charges. With `true`, `one_way` translation sends all supported
-source languages to Chinese. Language identification happens in Soniox, with no extra local
-recognizer or separate language-detection API call. See [translation modes](https://soniox.com/docs/translation/stt-translation).
+With `SONIOX_TRANSLATE_ENGLISH=false`, Soniox uses Korean/Chinese `two_way` translation.
+Korean's native Chinese translation goes directly to Discord; English uses its original
+transcript. Only finalized Japanese and other languages outside Korean/English/Chinese are
+sent to `TEXT_TRANSLATION_MODEL` using `GEMINI_API_KEY`. Spoken Chinese is normalized with
+OpenCC; the reverse Korean translation is suppressed locally but may still incur Soniox
+output charges. Soniox rejects `exclude_source_languages`, so this hybrid handles every
+non-English language without translating English. Gemini fallback usage is billed separately.
+No Korean or English segments are submitted to Gemini, and no translated audio is generated.
+
+For fallback languages, final subword tokens are joined until sentence punctuation, a language change, an endpoint,
+six seconds of finalized speech, or 600 characters. Requests run in order to preserve subtitle
+sequence; only fallback languages incur an extra text-generation delay. A final partial sentence
+is drained when the audio ends. Translation failures surface as job errors rather than silently
+dropping text. Language routing depends on Soniox's recognition and may misclassify short phrases.
+
+YouTube HLS capture starts at the latest available segment (`live_start_index=-1`), avoiding
+FFmpeg's default two extra segments of lag (about ten seconds with five-second segments).
+Segment publication, recognition finalization, and Discord delivery still add latency; the
+latest segment can also be more sensitive to brief network stalls.
+
+With `SONIOX_TRANSLATE_ENGLISH=true`, Soniox's native `one_way` translation sends all supported
+source languages to Chinese, with no separate text API. Language identification happens in
+Soniox, with no local recognizer or separate language-detection API call.
+See [translation modes](https://soniox.com/docs/translation/stt-translation).
 
 Only final tokens are posted: revisable hypotheses and `<end>`/`<fin>` markers are excluded.
 `glossary.md` mappings are sent as context/translation terms; these guide the model and do not
@@ -102,6 +122,44 @@ On a Mac, prevent the machine from sleeping while the service should be watching
 ```
 caffeinate -i uv run uvicorn nmixx_subtitles.main:app --port 8080
 ```
+
+## FANS through iPhone Mirroring (Mac)
+
+Open iPhone Mirroring on the Mac, play FANS, and confirm that its audio is audible on
+the Mac. The manual runner uses macOS ScreenCaptureKit to capture only iPhone Mirroring
+audio and converts it to the existing 16 kHz mono subtitle input. It requires macOS 15+,
+the Swift compiler (`swiftc`), ffmpeg, and Screen & System Audio Recording permission for
+the terminal/app running the command. No cable or virtual audio driver is needed.
+
+```sh
+# Ten-minute trial using the configured provider, with subtitles sent to Discord:
+uv run python -m nmixx_subtitles.mirror --seconds 600 --discord
+
+# Terminal subtitles only (still calls the paid translation API):
+uv run python -m nmixx_subtitles.mirror --seconds 60
+```
+
+For this runner, `--discord` reads `DISCORD_WEBHOOK_URL` directly from **this project's
+`.env`**, even if the shell has a different webhook configured. A missing project webhook
+is an error; there is no fallback to a machine-wide destination.
+
+Keep FANS playing through iPhone Mirroring. Ctrl+C stops the session. `--seconds` sets a
+limit of 1–7200 seconds (default 600); capture also stops on lost audio input or 90 seconds
+of silence (15 seconds if no signal has appeared yet). Each invocation must be started
+manually; it does not detect FANS broadcasts or modify YouTube job state. Only one mirror
+session may run at a time. The Swift helper is compiled into `~/Library/Caches/nmixx-live-subtitles`.
+
+## Local recording and quality review
+
+Live YouTube jobs and manual FANS sessions now record the input audio and structured
+evidence locally by default. After the session, an offline check screens for the 16
+previously observed issue categories and creates an HTML audio review page. It adds no
+AI API requests. Candidates require review; they are not confirmed translation errors.
+
+Files go to `~/Library/Application Support/nmixx-subtitles/sessions/<session>/`.
+Default retention is seven days with an approximate 2 GiB storage budget; completed old
+sessions are cleaned at the next session start. Set `QUALITY_CAPTURE_ENABLED=false` to
+disable. See [recording, review and retention instructions](docs/quality-review.md).
 
 ## Run
 
@@ -181,7 +239,10 @@ within ~10 minutes. Streams that happen while the Mac is off are simply missed.
 uv run python tests/smoke_trigger.py         # WebSub + videos.list + watchdog against real APIs
 uv run python tests/test_live_translate.py   # Gemini Live Translate stream, offline checks
 uv run python tests/test_soniox_translate.py # Soniox protocol, mixed languages, conversion, offline checks
+uv run python tests/test_text_translate.py   # English bypass, multilingual routing, text API lifecycle
+uv run python tests/test_hybrid_subtitles.py # native Korean avoids text API waits; fallback languages only
 uv run python tests/test_capture.py         # early capture shutdown (local ffmpeg, no APIs)
+uv run python tests/test_mirror.py          # project-specific Discord destination, no APIs
 uv run python tests/test_main_pipeline.py    # pipeline wiring, offline checks
 uv run python -m nmixx_subtitles.discord     # Discord poster, offline checks
 ```

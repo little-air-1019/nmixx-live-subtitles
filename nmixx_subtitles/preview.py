@@ -29,6 +29,7 @@ async def limited_pcm(source: str, seconds: int):
 async def preview(source: str, *, seconds: int, provider: str) -> None:
     validate_provider(provider)
     poster = ConsolePoster("http://unused.invalid", transform=subtitle_transform(provider))
+    poster._record_destination = "console"
     count = 0
     try:
         async with asyncio.timeout(seconds + 60):

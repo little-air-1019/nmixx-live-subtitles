@@ -6,3 +6,4 @@ state.json
 *.log
 tests/*.m4a
 tests/*.wav
+sessions/
